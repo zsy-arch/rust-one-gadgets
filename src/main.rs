@@ -215,6 +215,7 @@ fn gadgets_from_file_scan(file: &str, level: u32) -> Vec<gadget::Gadget> {
         let t = std::time::Instant::now();
         let found = match libc.arch {
             elf::Arch::Aarch64 => search21::Searcher::new(&libc, &search21::aarch64::Aarch64Search).find(),
+            elf::Arch::Arm => search21::Searcher::new(&libc, &search21::arm::ArmSearch).find(),
             _ => {
                 eprintln!("rog: arch {:?} not yet supported by search21", libc.arch);
                 std::process::exit(1);

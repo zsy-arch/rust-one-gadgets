@@ -9,6 +9,7 @@
 //! 架构适配（branch_kind / call 判定 / scan_calls）在 `aarch64` 等子模块。
 
 pub mod aarch64;
+pub mod arm;
 
 use crate::elf::Libc;
 use crate::emulator21::processor::is_terminal_call;
@@ -40,6 +41,27 @@ pub trait ArchSearch {
     fn new_state(&self) -> crate::emulator21::processor::State;
     /// 模拟一行（process 语义：refused 记 st.refused_line；终端哨兵=成功）。
     fn process(&self, st: &mut crate::emulator21::processor::State, line: &str) -> bool;
+    /// 一次 find() 的开始（arm：装载 libc 字节供 literal pool 读取）。
+    fn begin(&self, _libc: &Libc) {}
+    /// 候选级准备（arm：note_instruction_set + GOT 基址寄存器播种）。
+    /// 返回被播种的寄存器名（resolve 时前置 GOT 约束）。
+    fn prepare(
+        &self,
+        _st: &mut crate::emulator21::processor::State,
+        _ctx: &SearchCtx,
+        _lines: &[String],
+    ) -> Vec<String> {
+        Vec::new()
+    }
+    /// resolve 后约束修正（arm：GOT 基址约束前置 + writable:reg 剔除）。
+    fn fixup(&self, _gots: &[String], _constraints: &mut Vec<String>) {}
+}
+
+/// prepare 的搜索上下文（全行表 + 窗口起点 + 地址索引）。
+pub struct SearchCtx<'a> {
+    pub lines: &'a [String],
+    pub window_starts: &'a HashSet<usize>,
+    pub index: &'a HashMap<u64, usize>,
 }
 
 /// 分支类型。
@@ -56,7 +78,6 @@ pub struct Searcher<'a> {
     /// 行索引 → 地址。
     addr_at: Vec<u64>,
     /// 地址 → 行索引。
-    #[allow(dead_code)] // mips（延迟槽跳转回填）接入后使用
     index: HashMap<u64, usize>,
     /// 窗口起点（多个窗口拼接时行间无 fall-through）。
     window_starts: HashSet<usize>,
@@ -96,6 +117,7 @@ impl<'a> Searcher<'a> {
 
     /// 全部 gadget（base.rb#search）。
     pub fn find(&self) -> Vec<Gadget> {
+        self.arch.begin(self.libc);
         let mut gadgets = Vec::new();
         let mut seen: HashSet<String> = HashSet::new();
         let mut refused: HashSet<String> = HashSet::new();
@@ -108,9 +130,8 @@ impl<'a> Searcher<'a> {
                 if refused_before_call(&refused, &suffix) {
                     continue;
                 }
-                match resolve_suffix(self.libc, self.arch, &suffix) {
-                    Ok(Some(g)) => gadgets.push(g),
-                    _ => {}
+                if let Ok(Some(g)) = self.resolve_suffix(&suffix) {
+                    gadgets.push(g);
                 }
                 if let Some(line) = LAST_REFUSED.take() {
                     refused.insert(line);
@@ -246,13 +267,13 @@ fn refused_before_call(refused: &HashSet<String>, window: &[String]) -> bool {
         .any(|l| refused.contains(l))
 }
 
+impl<'a> Searcher<'a> {
 /// resolve_suffix：模拟 + resolve21（失败返回 Ok(None)；refused 行经 thread_local 带出）。
-fn resolve_suffix(
-    libc: &Libc,
-    arch: &dyn ArchSearch,
-    lines: &[String],
-) -> Result<Option<Gadget>, ()> {
+fn resolve_suffix(&self, lines: &[String]) -> Result<Option<Gadget>, ()> {
+    let (libc, arch) = (self.libc, self.arch);
+    let ctx = SearchCtx { lines: &self.lines, window_starts: &self.window_starts, index: &self.index };
     let mut st = arch.new_state();
+    let gots = arch.prepare(&mut st, &ctx, lines);
     let mut reached_call = false;
     for l in lines {
         if !arch.process(&mut st, l) {
@@ -285,8 +306,11 @@ fn resolve_suffix(
             u64::from_str_radix(&s[..end], 16).unwrap_or(0)
         })
         .unwrap_or(0);
-    // master：prune_settled 在 Gadget 构造器内执行
-    Ok(Some(Gadget::new(offset, effect, gadget21::prune_settled(constraints))))
+    // master：prune_settled 在 Gadget 构造器内执行；arm 的 GOT 约束前置
+    let mut constraints = gadget21::prune_settled(constraints);
+    arch.fixup(&gots, &mut constraints);
+    Ok(Some(Gadget::new(offset, effect, constraints)))
+}
 }
 
 /// 终端符号地址集（.dynsym/.symtab 前缀 exec/posix_spawn）。

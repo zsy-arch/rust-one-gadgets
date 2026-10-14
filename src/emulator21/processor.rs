@@ -194,8 +194,11 @@ pub struct State {
     #[allow(dead_code)] // mips/arm 切片接入后使用
     pub line_addr: u64,
     /// arm：当前窗口是否 thumb（value_of 的 pc 偏移）。
-    #[allow(dead_code)] // arm 切片接入后使用
     pub thumb: bool,
+    /// arm：track_mode 的上一行地址（2 字节步距证明 thumb）。
+    pub(crate) prev_addr: u64,
+    /// arm：当前行的 literal pool 地址（pc 相对 ldr 用）。
+    pub(crate) literal: Option<u64>,
 }
 
 impl State {
@@ -217,6 +220,8 @@ impl State {
             derived_writes: Vec::new(),
             line_addr: 0,
             thumb: false,
+            prev_addr: 0,
+            literal: None,
         }
     }
 

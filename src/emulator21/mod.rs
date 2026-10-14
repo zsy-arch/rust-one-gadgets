@@ -14,6 +14,7 @@ use std::fmt;
 pub mod processor;
 pub mod mixins;
 pub mod aarch64;
+pub mod arm;
 
 /// 一个符号值：整数、寄存器表达式、call 目标字符串或「被 call 破坏」哨兵。
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]

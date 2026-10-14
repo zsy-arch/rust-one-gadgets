@@ -457,22 +457,22 @@ pub fn shorthand<'a>(dst: &'a str, src: &'a str, op2: &'a str) -> (&'a str, &'a 
 
 /// offset_result：rhs 为整数 → 直接折叠；加法 lhs 整数交换。
 fn offset_result(plus: bool, lhs: &Val, rhs: &Val) -> Option<Val> {
-    let Val::Int(r) = rhs else { return None };
-    match lhs {
-        Val::Int(l) => Some(Val::Int(if plus { l + r } else { l - r })),
-        Val::Lambda(l) => Some(Val::Lambda(if plus { l.clone().add(*r) } else { l.clone().add(-*r) })),
-        _ => None,
+    // rhs 为整数 → 直接折叠
+    if let Val::Int(r) = rhs {
+        return match lhs {
+            Val::Int(l) => Some(Val::Int(if plus { l + r } else { l - r })),
+            Val::Lambda(l) => Some(Val::Lambda(if plus { l.clone().add(*r) } else { l.clone().add(-*r) })),
+            _ => None,
+        };
     }
-    .or_else(|| {
-        if plus {
-            if let Val::Int(l) = lhs {
-                if let Val::Lambda(r) = rhs {
-                    return Some(Val::Lambda(r.clone().add(*l)));
-                }
-            }
+    // 加法的 lhs 为整数 → 交换后折叠（Ruby offset_result 原语义；
+    // arm 的 `ldr r0, [pc]; add r0, pc` = Int + $base 走此路径）
+    if plus {
+        if let (Val::Int(l), Val::Lambda(r)) = (lhs, rhs) {
+            return Some(Val::Lambda(r.clone().add(*l)));
         }
-        None
-    })
+    }
+    None
 }
 
 /// operation_result（字符串 op 形式）。

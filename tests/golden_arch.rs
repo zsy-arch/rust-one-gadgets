@@ -111,3 +111,80 @@ fn aarch64_glibc_smoke() {
     }
     assert!(checked >= 8, "expected >=8 aarch64 samples, checked {checked}");
 }
+
+/// arm 黄金偏移表（同上，来自 master 对 9 个 arm 样本的 -l 0 / -l 1 --raw 实测；
+/// pretty 输出亦逐字节一致）。
+const GOLDEN_ARM_L0: &[(&str, &[u64])] = &[
+    ("libc-2.23.so", &[0x2c626, 0x84dc4, 0x8722c, 0x8722e, 0x87232]),
+    ("libc-2.23-0ubuntu3.so", &[0x2c626, 0x84dc4, 0x8722c, 0x8722e, 0x87232]),
+    ("libc-2.27.so", &[0x2d39c, 0x73f96, 0x73fa4]),
+    ("libc-2.27-3ubuntu1.5.so", &[0x2d39c, 0x73ca6, 0x73cb4]),
+    ("libc-2.31-0ubuntu9.18.so", &[0x7811a, 0x7812a, 0x8dbdc, 0x8df70]),
+    ("libc-2.35-0ubuntu3.15.so", &[0x351a6, 0x8887a, 0x9e1b6]),
+    ("libc-2.39.so", &[0x38f6c, 0x88a7c, 0x9f2be]),
+    ("libc-2.39-0ubuntu8.9.so", &[0x38f6c, 0x88abc, 0x9f2fe]),
+    ("libc-2.41-6ubuntu1.2.so", &[0x3a8ac, 0x8c6aa, 0xa3236]),
+];
+
+const GOLDEN_ARM_L1: &[(&str, &[u64])] = &[
+    ("libc-2.23.so", &[0x2c3da, 0x2c5e2, 0x2c5e8, 0x2c5ea, 0x2c5ec, 0x2c5f0, 0x2c5f4, 0x2c626, 0x46276, 0x46278, 0x84dc4, 0x8722c, 0x8722e, 0x87232]),
+    ("libc-2.23-0ubuntu3.so", &[0x2c3da, 0x2c5e2, 0x2c5e8, 0x2c5ea, 0x2c5ec, 0x2c5f0, 0x2c5f4, 0x2c626, 0x46276, 0x46278, 0x84dc4, 0x8722c, 0x8722e, 0x87232]),
+    ("libc-2.27.so", &[0x2d192, 0x2d356, 0x2d35e, 0x2d360, 0x2d362, 0x2d366, 0x2d368, 0x2d36a, 0x2d36c, 0x2d39c, 0x47a60, 0x47a62, 0x73f2a, 0x73f2c, 0x73f96, 0x73f98, 0x73f9a, 0x73f9c, 0x73fa4]),
+    ("libc-2.27-3ubuntu1.5.so", &[0x2d192, 0x2d356, 0x2d35e, 0x2d360, 0x2d362, 0x2d366, 0x2d368, 0x2d36a, 0x2d36c, 0x2d39c, 0x47a60, 0x47a62, 0x73c3a, 0x73c3c, 0x73ca6, 0x73ca8, 0x73caa, 0x73cac, 0x73cb4]),
+    ("libc-2.31-0ubuntu9.18.so", &[0x2ef8e, 0x2f28e, 0x2f290, 0x2f292, 0x2f294, 0x49962, 0x49984, 0x49986, 0x49988, 0x780a4, 0x780a6, 0x7811a, 0x7811c, 0x7811e, 0x7812a, 0x8dbdc, 0x8df6e, 0x8df70]),
+    ("libc-2.35-0ubuntu3.15.so", &[0x35186, 0x35188, 0x351a2, 0x351a4, 0x351a6, 0x4edf4, 0x4edf6, 0x4edfa, 0x4ee0e, 0x8887a, 0x9e1b4, 0x9e1b6]),
+    ("libc-2.39.so", &[0x38f46, 0x38f48, 0x38f68, 0x38f6a, 0x38f6c, 0x504ae, 0x504b0, 0x88a7c, 0x9f2bc, 0x9f2be]),
+    ("libc-2.39-0ubuntu8.9.so", &[0x38f46, 0x38f48, 0x38f68, 0x38f6a, 0x38f6c, 0x504de, 0x504e0, 0x88abc, 0x9f2fc, 0x9f2fe]),
+    ("libc-2.41-6ubuntu1.2.so", &[0x3a886, 0x3a888, 0x3a8a4, 0x3a8a8, 0x3a8aa, 0x3a8ac, 0x53b88, 0x53b8a, 0x8c6aa, 0xa31c6, 0xa3232, 0xa3236]),
+];
+
+fn check_golden_arm(level: u32, golden: &[(&str, &[u64])]) {
+    let dir = samples_dir().join("glibc/arm");
+    if !dir.exists() {
+        eprintln!("samples dir missing: {} — skipping", dir.display());
+        return;
+    }
+    for (name, want) in golden {
+        let p = dir.join(name);
+        if !p.exists() {
+            eprintln!("{name} not in samples — skipping");
+            continue;
+        }
+        let got = run_rog(&p, level);
+        let got_offsets: Vec<u64> =
+            got.split_whitespace().map(|s| s.parse().unwrap()).collect();
+        assert_eq!(&got_offsets, want, "{name} l{level}: offsets diverge from master");
+    }
+}
+
+#[test]
+fn arm_glibc_golden_l0() {
+    check_golden_arm(0, GOLDEN_ARM_L0);
+}
+
+#[test]
+fn arm_glibc_golden_l1() {
+    check_golden_arm(1, GOLDEN_ARM_L1);
+}
+
+/// 冒烟：每个 arm glibc 样本 l1 都能跑完且产出非空 gadget 集。
+#[test]
+fn arm_glibc_smoke() {
+    let dir = samples_dir().join("glibc/arm");
+    if !dir.exists() {
+        eprintln!("samples dir missing: {} — skipping", dir.display());
+        return;
+    }
+    let mut checked = 0;
+    for entry in std::fs::read_dir(&dir).expect("read arm dir").flatten() {
+        let p = entry.path();
+        if p.extension().map(|e| e != "so").unwrap_or(true) {
+            continue;
+        }
+        let got = run_rog(&p, 1);
+        let n = got.split_whitespace().count();
+        assert!(n > 0, "{} produced no gadgets", p.display());
+        checked += 1;
+    }
+    assert!(checked > 0, "no arm samples found");
+}
