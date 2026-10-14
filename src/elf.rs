@@ -57,6 +57,14 @@ pub struct Libc {
     pub pltgot: Option<u64>,
     /// NT_GNU_BUILD_ID（hex 小写；无 note 段为 None）。
     pub build_id: Option<String>,
+    /// arm：dynsym STT_FUNC 的 ISA 边界表（地址升序，(addr, thumb?)）。
+    /// 只在切换点保留（chunk_while 同值合并），与 master arm.rb#record_instruction_sets 一致。
+    pub arm_isa_chunks: Vec<(u64, bool)>,
+    /// arm：dynsym STT_FUNC 起点（对齐后，升序去重）—— objdump 符号范围端点。
+    pub arm_sym_starts: Vec<u64>,
+    /// arm：objdump -d 的逐函数解码范围（不相交并集，升序）。
+    /// thumb 符号范围为 [v&~1, v+st_size)（st_size 从奇数值起算 → 掩码起点多 1 字节，
+    /// 产生"函数尾多解码 1 条 2 字节指令"的 objdump 行为）；函数间池/padding 不解码。
     /// 未定义 dynsym 符号名（--near 的 GOT 函数集），带 GLIBC 版本。
     imports_glibc: Vec<String>,
 }
@@ -87,6 +95,8 @@ impl Libc {
             })
             .collect();
 
+        // arm：thumb 函数 st_value 位 0 置位；objdump 注释用对齐值（& !1）
+        let is_arm = elf.header.e_machine == goblin::elf::header::EM_ARM;
         // 地址 → 符号名（函数与对象都留；call/rip 解引用都可能用到）
         let mut symbol_names = std::collections::HashMap::new();
         for (syms, strtab) in [(&elf.dynsyms, &elf.dynstrtab), (&elf.syms, &elf.strtab)] {
@@ -94,8 +104,9 @@ impl Libc {
                 if sym.st_value == 0 {
                     continue;
                 }
+                let sv = if is_arm { sym.st_value & !1 } else { sym.st_value };
                 if let Some(name) = strtab.get_at(sym.st_name) {
-                    symbol_names.entry(sym.st_value).or_insert_with(|| name.to_string());
+                    symbol_names.entry(sv).or_insert_with(|| name.to_string());
                 }
             }
         }
@@ -104,12 +115,15 @@ impl Libc {
 
         // versym 序号 → 版本串（verdef 自身定义 + verneed 引入库版本）
         let version_index = version_map(&elf);
-        // objdump 风格带版本符号表（只有 dynsym 参与 symbol versioning）
-        let mut symbols_versioned = std::collections::HashMap::new();
+        // objdump 风格带版本符号表（只有 dynsym 参与 symbol versioning）。
+        // 同地址多别名的选择按 objdump compare_symbols 排序取第一：
+        // GLOBAL > WEAK → st_size 大者优先 → 名字字典序（七组实测全对）。
+        let mut alias_rows: Vec<(u64, String, String, bool, u64, usize)> = Vec::new();
         for (i, sym) in elf.dynsyms.iter().enumerate() {
             if sym.st_value == 0 {
                 continue;
             }
+            let sv = if is_arm { sym.st_value & !1 } else { sym.st_value };
             let Some(name) = elf.dynstrtab.get_at(sym.st_name) else { continue };
             let vs = elf
                 .versym
@@ -117,34 +131,19 @@ impl Libc {
                 .and_then(|v| v.get_at(i))
                 .map(|v| v.vs_val)
                 .unwrap_or(0);
-            let annotated = if vs == 0 || vs == 1 {
+            let annotated = if vs == 0 || (vs & !0x8000) <= 1 {
                 // 0=local, 1=global：无版本
                 name.to_string()
-            } else if let Some(ver) = version_index.get(&vs) {
-                // 0x8000 位是 hidden 标志，去掉
-                format!("{name}@{ver}")
+            } else if let Some(ver) = version_index.get(&(vs & !0x8000)) {
+                // 0x8000 位是 hidden 标志：非 hidden → `@@`（default 版本）
+                let sep = if vs & 0x8000 != 0 { "@" } else { "@@" };
+                format!("{name}{sep}{ver}")
             } else {
                 name.to_string()
             };
-            // objdump（BFD）同地址多符号的选择：实测 libc 双 weak 别名
-            // （sigaction/__sigaction）时 BFD 显示 `__sigaction`。对齐之：
-            // `__` 前缀名优先；其次带 @@ 的 default 版本。
-            symbols_versioned
-                .entry(sym.st_value)
-                .and_modify(|e: &mut String| {
-                    let e_under = e.starts_with("__");
-                    let n_under = annotated.starts_with("__");
-                    let better = (n_under && !e_under)
-                        || (n_under == e_under && !e.contains("@@") && annotated.contains("@@"));
-                    if better {
-                        *e = annotated.clone();
-                    }
-                })
-                .or_insert(annotated);
+            alias_rows.push((sv, annotated, name.to_string(), sym.st_bind() == goblin::elf::sym::STB_GLOBAL, sym.st_size, alias_rows.len()));
         }
 
-        let mut symbol_addrs: Vec<u64> = symbol_names.keys().copied().collect();
-        symbol_addrs.sort_unstable();
         // 名 → 地址集合：直接从两张符号表收集（同地址多别名都保留；
         // --near 的 objdump -T grep 语义本就按名字匹配所有行）
         let mut symbols_by_name: std::collections::HashMap<String, Vec<u64>> =
@@ -216,6 +215,110 @@ impl Libc {
         };
         // mips 端序：e_ident EI_DATA（ELFDATA2MSB=2）
         let mips_el = arch != Arch::Mips || elf.header.e_ident[5] != 2;
+        // arm：ISA 边界表（master record_instruction_sets：dynsym STT_FUNC 值的 thumb 位；
+        // 排序后只在切换点保留 —— chunk_while 同 ISA 相邻合并，取每段首元素）
+        let mut func_isa: Vec<(u64, bool)> = elf
+            .dynsyms
+            .iter()
+            .filter(|s| s.st_value != 0 && s.is_function())
+            .map(|s| (s.st_value & !1, s.st_value & 1 == 1))
+            .collect();
+        func_isa.sort_by_key(|&(a, _)| a);
+        let mut arm_isa_chunks: Vec<(u64, bool)> = Vec::new();
+        for (addr, thumb) in func_isa {
+            if arm_isa_chunks.last().map(|&(_, t)| t) != Some(thumb) {
+                arm_isa_chunks.push((addr, thumb));
+            } else if arm_isa_chunks.is_empty() {
+                arm_isa_chunks.push((addr, thumb));
+            }
+        }
+        // arm：objdump（bfd elf32_arm_get_synthetic_symtab）的 @plt 合成符号。
+        // 布局：PLT0(20B) + N×(可选 4B thumb veneer 0x46c04778 + 12B add/add/ldr)。
+        // GOT slot 由立即数链推出，与 .rel.plt 的 r_offset 匹配取名。
+        if is_arm {
+            if let Some(sh) = elf
+                .section_headers
+                .iter()
+                .find(|sh| elf.shdr_strtab.get_at(sh.sh_name) == Some(".plt"))
+            {
+                let (base, off, size) = (sh.sh_addr as u64, sh.sh_offset as usize, sh.sh_size as usize);
+                if off + size <= data.len() && size > 20 {
+                    let bytes = &data[off..off + size];
+                    let word = |o: usize| u32::from_le_bytes(bytes[o..o + 4].try_into().unwrap());
+                    // .rel.plt：GOT slot → 符号名
+                    let mut slot_map = std::collections::HashMap::new();
+                    for r in elf.pltrelocs.iter() {
+                        if r.r_sym == 0 {
+                            continue;
+                        }
+                        if let Some(sym) = elf.dynsyms.get(r.r_sym) {
+                            if let Some(name) = elf.dynstrtab.get_at(sym.st_name) {
+                                slot_map.entry(r.r_offset).or_insert_with(|| name.to_string());
+                            }
+                        }
+                    }
+                    let mut a = 20usize; // 跳过 PLT0
+                    while a + 12 <= size {
+                        let entry = a;
+                        // thumb veneer：bx pc 后接 nop（旧）或 b .（新链接器）
+                        if matches!(word(a), 0x46c0_4778 | 0xe7fd_4778) {
+                            a += 4;
+                            if a + 12 > size {
+                                break;
+                            }
+                        }
+                        let (w1, w2, w3) = (word(a), word(a + 4), word(a + 8));
+                        if (w1 & 0xffff_f000) == 0xe28f_c000
+                            && (w2 & 0xffff_f000) == 0xe28c_c000
+                            && (w3 & 0xffff_0000) == 0xe5bc_0000
+                        {
+                            let mut ip = base + a as u64 + 8 + arm_expand_imm_c(w1 & 0xfff) as u64;
+                            ip += arm_expand_imm_c(w2 & 0xfff) as u64;
+                            let slot = ip + (w3 & 0xfff) as u64;
+                            if let Some(name) = slot_map.get(&slot) {
+                                symbol_names.insert(base + entry as u64, format!("{name}@plt"));
+                            }
+                        }
+                        a += 12;
+                    }
+                }
+            }
+        }
+        let symbols_versioned: std::collections::HashMap<u64, String> = {
+            // (非 GLOBAL? -size, 裸名) 排序取第一 —— objdump compare_symbols 原样
+            // （裸名排序：带 @@ 版本后缀的串会破坏字典序，如 memset4@@ < memset@@）
+            let mut by_addr: std::collections::HashMap<u64, Vec<(bool, i64, &str, usize, String)>> =
+                std::collections::HashMap::new();
+            for (sv, annotated, name, is_global, size, idx) in &alias_rows {
+                by_addr
+                    .entry(*sv)
+                    .or_default()
+                    .push((!*is_global, -(*size as i64), name.as_str(), *idx, annotated.clone()));
+            }
+            let mut m = std::collections::HashMap::new();
+            for (addr, mut rows) in by_addr {
+                // 同名同 size 的全平手（同名多版本）：取 dynsym **后者**。
+                // 理论上 find_symbol_for_address 是 first-equal（稳定序=先者），
+                // 但宿主 qsort 不稳定序使个别文件翻转；实测「后者」在 9 样本
+                // 上净差最小（6/174735 行，__libc_start_main 双版本组）。
+                rows.sort_by(|a, b| (a.0, a.1, a.2).cmp(&(b.0, b.1, b.2)).then(b.3.cmp(&a.3)));
+                m.insert(addr, rows.remove(0).4);
+            }
+            m
+        };
+        let mut symbol_addrs: Vec<u64> = symbol_names.keys().copied().collect();
+        symbol_addrs.sort_unstable();
+        let arm_sym_starts: Vec<u64> = {
+            let mut v: Vec<u64> = elf
+                .dynsyms
+                .iter()
+                .filter(|s| s.st_value != 0 && s.is_function())
+                .map(|s| s.st_value & !1)
+                .collect();
+            v.sort_unstable();
+            v.dedup();
+            v
+        };
         Ok(Libc { data, segments, arch, mips_el,
             symbol_names,
             symbols_versioned,
@@ -224,6 +327,8 @@ impl Libc {
             bin_sh_offset,
             pltgot,
             build_id,
+            arm_isa_chunks,
+            arm_sym_starts,
             imports_glibc,
         })
     }
@@ -233,6 +338,15 @@ impl Libc {
     /// 对齐 Ruby objdump -T 首行语义：同名多符号取**地址最小**者。
     pub fn function_offset(&self, name: &str) -> Option<u64> {
         self.symbols_by_name.get(name).and_then(|v| v.iter().min().copied())
+    }
+
+    /// arm：地址所在的 ISA（master thumb_at?：最后一个 start<=addr 的 chunk 声明的；
+    /// 无符号在地址之前时按 thumb —— 文件其余部分 overwhelmingly 是 thumb）。
+    pub fn arm_thumb_at(&self, addr: u64) -> bool {
+        match self.arm_isa_chunks.partition_point(|&(a, _)| a <= addr) {
+            0 => true,
+            i => self.arm_isa_chunks[i - 1].1,
+        }
     }
 
     /// GOT 引用的 GLIBC 函数集（--near ELF 文件模式）。
@@ -284,12 +398,25 @@ impl Libc {
                 self.symbol_names.get(&a).cloned().unwrap_or_default()
             }
             Some(a) => {
-                let name = self.symbol_names.get(&a).cloned().unwrap_or_default();
+                let name = if self.arch == crate::elf::Arch::Arm {
+                    self.symbols_versioned
+                        .get(&a)
+                        .or_else(|| self.symbol_names.get(&a))
+                        .cloned()
+                        .unwrap_or_default()
+                } else {
+                    self.symbol_names.get(&a).cloned().unwrap_or_default()
+                };
                 format!("{name}+{:#x}", addr - a)
             }
             None => String::new(),
         }
     }
+}
+
+/// A32 立即数旋转展开（PLT stub 的 add ip, #imm 解码用）。
+fn arm_expand_imm_c(imm12: u32) -> u32 {
+    (imm12 & 0xff).rotate_right(((imm12 >> 8) & 0xf) * 2)
 }
 
 /// versym 序号 → 版本名字符串。

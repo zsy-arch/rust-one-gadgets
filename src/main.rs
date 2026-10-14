@@ -70,10 +70,19 @@ struct Cli {
     /// libc 基址
     #[arg(long, default_value_t = 0)]
     base: u64,
+
+    /// 开发用：arm textgen 与 master objdump 行流比对（FILE 为窗口 GT 文件目录）
+    #[arg(long = "arm-gt-check", hide = true)]
+    arm_gt_check: bool,
 }
 
 fn main() {
     let cli = Cli::parse();
+
+    if cli.arm_gt_check {
+        arm_gt_check(&cli.file.clone().unwrap_or_default());
+        return;
+    }
 
     // --info BuildID：打印数据库注释后退出
     if let Some(id) = &cli.info {
@@ -265,4 +274,84 @@ fn display_gadgets(gadgets: &[gadget::Gadget], cli: &Cli) {
             }
         }
     }
+}
+
+/// 开发工具：arm textgen 输出与 /tmp/arm_gt 的 master objdump 行流逐行比对。
+/// 用法：rog --arm-gt-check <libc文件>；GT 文件名 = <libc文件名>.txt。
+#[allow(dead_code)]
+fn arm_gt_check(file: &str) {
+    use crate::textgen::arm::disassemble_range;
+    let data = std::fs::read(file).unwrap();
+    let libc = crate::elf::Libc::parse(data).unwrap();
+    let gt_file = format!(
+        "/tmp/arm_gt/{}.txt",
+        std::path::Path::new(file)
+            .file_stem()
+            .unwrap()
+            .to_str()
+            .unwrap()
+    );
+    let gt: Vec<(bool, String)> = std::fs::read_to_string(&gt_file)
+        .unwrap()
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(|l| match l.strip_prefix('W') {
+            Some(r) => (true, r.to_string()),
+            None => (false, l.trim_start().to_string()),
+        })
+        .collect();
+    let mut windows: Vec<Vec<String>> = vec![];
+    for (is_start, line) in gt {
+        if is_start {
+            windows.push(vec![]);
+        }
+        windows.last_mut().unwrap().push(line);
+    }
+    let mut bad = 0usize;
+    let mut shown = 0usize;
+    let mut total = 0usize;
+    for w in &windows {
+        let first_addr = u64::from_str_radix(w[0].split(':').next().unwrap(), 16).unwrap();
+        let last_addr =
+            u64::from_str_radix(w.last().unwrap().split(':').next().unwrap(), 16).unwrap();
+        let mut bounds: Vec<u64> = vec![first_addr];
+        for &(a, _) in &libc.arm_isa_chunks {
+            if a > first_addr && a <= last_addr {
+                bounds.push(a);
+            }
+        }
+        bounds.sort_unstable();
+        bounds.dedup();
+        let mut got: Vec<String> = Vec::new();
+        for pair in bounds.windows(2) {
+            got.extend(disassemble_range(&libc, pair[0], pair[1]).into_iter().map(|l| l.text));
+        }
+        // 末段 hi：GT 末行是 OOB 标记 → 原窗口 stop 切在标记地址 +2（宽指令跨界）；
+        // 否则 stop ≥ 最后一条完整指令尾 → +4
+        let tail = if w.last().map(|l| l.contains("is out of bounds")).unwrap_or(false) {
+            2
+        } else {
+            4
+        };
+        got.extend(
+            disassemble_range(&libc, *bounds.last().unwrap(), last_addr + tail)
+                .into_iter()
+                .map(|l| l.text),
+        );
+        total += w.len();
+        // 尾部可能多解码 1-2 行（last+4 过冲）；按 min(len) 比对
+        for (g, want) in got.iter().zip(w.iter()) {
+            if g != want {
+                bad += 1;
+                if shown < 10 {
+                    println!("WANT: {want}\n GOT: {g}\n");
+                    shown += 1;
+                }
+            }
+        }
+        if got.len() != w.len() {
+            println!("LEN: got {} want {}", got.len(), w.len());
+        }
+    }
+    println!("TOTAL {bad}/{total} ({:.3}% bad)", bad as f64 * 100.0 / total as f64);
 }
