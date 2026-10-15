@@ -254,3 +254,84 @@ fn riscv64_glibc_smoke() {
     }
     assert!(checked >= 4, "expected >=4 riscv64 samples, checked {checked}");
 }
+
+/// mips o32（BE=mips / LE=mipsel）黄金偏移表（master 2.1.1 -l 0/-l 1 --raw 实测；
+/// pretty 输出亦逐字节一致）。
+const GOLDEN_MIPS_L0: &[(&str, &str, &[u64])] = &[
+    ("mips", "libc-2.19-18+deb8u10.so", &[270424, 270428, 751436]),
+    ("mips", "libc-2.24-11+deb9u4.so", &[254128, 254144]),
+    ("mips", "libc-2.28-10+deb10u1.so", &[258712, 258728]),
+    ("mipsel", "libc-2.36-9+deb12u14.so", &[308268, 308288]),
+    ("mipsel", "libc-2.36.so", &[308268, 308288]),
+];
+
+const GOLDEN_MIPS_L1: &[(&str, &str, &[u64])] = &[
+    ("mips", "libc-2.19-18+deb8u10.so", &[270424, 270428, 751436, 751444]),
+    ("mips", "libc-2.24-11+deb9u4.so", &[254128, 254144, 1299888, 1299892]),
+    ("mips", "libc-2.28-10+deb10u1.so", &[258712, 258728, 1343244, 1343248]),
+    (
+        "mipsel",
+        "libc-2.36-9+deb12u14.so",
+        &[308184, 308260, 308268, 308288, 467664, 467672, 1604264, 1604268],
+    ),
+    (
+        "mipsel",
+        "libc-2.36.so",
+        &[308184, 308260, 308268, 308288, 467664, 467672, 1604264, 1604268],
+    ),
+];
+
+fn check_golden_mips(level: u32, golden: &[(&str, &str, &[u64])]) {
+    for (arch_dir, name, want) in golden {
+        let dir = samples_dir().join("glibc").join(arch_dir);
+        if !dir.exists() {
+            eprintln!("samples dir missing: {} — skipping", dir.display());
+            continue;
+        }
+        let p = dir.join(name);
+        if !p.exists() {
+            panic!("sample missing: {}", p.display());
+        }
+        let got = run_rog(&p, level);
+        let got_offsets: Vec<u64> =
+            got.split_whitespace().map(|s| s.parse().unwrap()).collect();
+        assert_eq!(
+            &got_offsets, want,
+            "{arch_dir}/{name} l{level}: offsets diverge from master"
+        );
+    }
+}
+
+#[test]
+fn mips_glibc_golden_l0() {
+    check_golden_mips(0, GOLDEN_MIPS_L0);
+}
+
+#[test]
+fn mips_glibc_golden_l1() {
+    check_golden_mips(1, GOLDEN_MIPS_L1);
+}
+
+/// 冒烟：每个 mips/mipsel glibc 样本 l1 都能跑完且产出非空 gadget 集。
+#[test]
+fn mips_glibc_smoke() {
+    let mut checked = 0;
+    for arch_dir in ["mips", "mipsel"] {
+        let dir = samples_dir().join("glibc").join(arch_dir);
+        if !dir.exists() {
+            eprintln!("samples dir missing: {} — skipping", dir.display());
+            continue;
+        }
+        for entry in std::fs::read_dir(&dir).expect("read mips dir").flatten() {
+            let p = entry.path();
+            if p.extension().is_none_or(|e| e != "so") {
+                continue;
+            }
+            let got = run_rog(&p, 1);
+            let n = got.split_whitespace().count();
+            assert!(n > 0, "{} produced no gadgets", p.display());
+            checked += 1;
+        }
+    }
+    assert!(checked >= 5, "expected >=5 mips samples, checked {checked}");
+}

@@ -363,12 +363,14 @@ fn check_envp(st: &mut State, libc: &Libc, envp_ptr: &Val, emit: &mut dyn FnMut(
     true
 }
 
-/// environ 符号判定（_*environ）。
+/// environ 符号判定（base.rb#environ? + mips 覆写）：
+/// mips 经 GOT 读全局，`[$base+0xN]` 剥 deref/括号后按 names[N] 判 `_*environ`；
+/// 其余架构无符号注释，保守 false。
 fn environ_str(s: &str) -> bool {
-    // aarch64：pc 相对 → $base+offset；无法直判符号名，保守 false
-    //（master 的 environ? 由符号注释决定；textgen symbolize 提供时再启用）
-    let _ = s;
-    false
+    let s = s.trim_matches(|c| c == '[' || c == ']');
+    let Some(hex) = s.strip_prefix("$base+0x") else { return false };
+    let Ok(off) = u64::from_str_radix(hex.trim_end_matches(']'), 16) else { return false };
+    crate::search21::mips::MipsSearch::environ_at(off)
 }
 
 fn resolve_execl(st: &mut State, libc: &Libc) -> Result<(Vec<String>, String), ()> {

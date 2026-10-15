@@ -41,8 +41,10 @@ pub struct Libc {
     /// 反汇编/模拟器用的架构判定。
     pub arch: Arch,
     /// mips 端序（true = little；仅 Arch::Mips 有意义）。
-    #[allow(dead_code)] // mips 切片接入后使用
     pub mips_el: bool,
+    /// mips e_flags 的 EF_MIPS_ARCH 位域（0=mips1 … 5=mips32r2 6=mips64r2 …）；
+    /// ≥5 视为 r2+（rdhwr/seb/seh/ext/ins/wsbh/rotr 可用）。
+    pub mips_arch_level: u8,
     /// 地址 → 符号名（dynsym + symtab 中带名字的函数符号）。
     pub symbol_names: std::collections::HashMap<u64, String>,
     /// 地址 → objdump 风格带版本符号（`name@@GLIBC_2.2.5`），注释渲染用。
@@ -62,6 +64,11 @@ pub struct Libc {
     pub arm_isa_chunks: Vec<(u64, bool)>,
     /// arm：dynsym STT_FUNC 起点（对齐后，升序去重）—— objdump 符号范围端点。
     pub arm_sym_starts: Vec<u64>,
+    /// mips：dynsym STT_FUNC 起点（升序去重）—— objdump -d 的 stop_offset 端点
+    /// （disassemble_section 逐符号分段；无 symtab 的 stripped libc 只用 .dynsym）。
+    pub mips_func_starts: Vec<u64>,
+    /// mips：objdump -d 反汇编的 AX section 序（(vaddr, size)，升序）。
+    pub mips_code_sections: Vec<(u64, u64)>,
     /// arm：objdump -d 的逐函数解码范围（不相交并集，升序）。
     /// thumb 符号范围为 [v&~1, v+st_size)（st_size 从奇数值起算 → 掩码起点多 1 字节，
     /// 产生"函数尾多解码 1 条 2 字节指令"的 objdump 行为）；函数间池/padding 不解码。
@@ -97,11 +104,20 @@ impl Libc {
 
         // arm：thumb 函数 st_value 位 0 置位；objdump 注释用对齐值（& !1）
         let is_arm = elf.header.e_machine == goblin::elf::header::EM_ARM;
+        let is_mips = elf.header.e_machine == EM_MIPS;
         // 地址 → 符号名（函数与对象都留；call/rip 解引用都可能用到）
         let mut symbol_names = std::collections::HashMap::new();
         for (syms, strtab) in [(&elf.dynsyms, &elf.dynstrtab), (&elf.syms, &elf.strtab)] {
             for sym in syms.iter() {
                 if sym.st_value == 0 {
+                    continue;
+                }
+                // STT_SECTION（无名）：bfd canonicalize 后 value=0，不参与地址
+                // 基准（否则 `.text` SECTION 符号以 sh_addr 值污染 nearest）。
+                // SHN_UNDEF：MIPS 未定义符号也带 value（ld.so 提示地址），同样污染。
+                if sym.st_type() == goblin::elf::sym::STT_SECTION
+                    || sym.st_shndx == 0
+                {
                     continue;
                 }
                 let sv = if is_arm { sym.st_value & !1 } else { sym.st_value };
@@ -121,6 +137,9 @@ impl Libc {
         let mut alias_rows: Vec<(u64, String, String, bool, u64, usize)> = Vec::new();
         for (i, sym) in elf.dynsyms.iter().enumerate() {
             if sym.st_value == 0 {
+                continue;
+            }
+            if sym.st_type() == goblin::elf::sym::STT_SECTION || sym.st_shndx == 0 {
                 continue;
             }
             let sv = if is_arm { sym.st_value & !1 } else { sym.st_value };
@@ -215,6 +234,9 @@ impl Libc {
         };
         // mips 端序：e_ident EI_DATA（ELFDATA2MSB=2）
         let mips_el = arch != Arch::Mips || elf.header.e_ident[5] != 2;
+        // EF_MIPS_ARCH = e_flags >> 28：0=mips1 1=mips2 2=mips3 3=mips4 4=mips5
+        // 5=mips32 6=mips64 7=mips32r2 8=mips64r2 9=mips32r6 10=mips64r6
+        let mips_arch_level = (elf.header.e_flags >> 28) as u8;
         // arm：ISA 边界表（master record_instruction_sets：dynsym STT_FUNC 值的 thumb 位；
         // 排序后只在切换点保留 —— chunk_while 同 ISA 相邻合并，取每段首元素）
         let mut func_isa: Vec<(u64, bool)> = elf
@@ -354,12 +376,28 @@ impl Libc {
                 // 同名同 size 的全平手（同名多版本）：先取**默认版本**（@@，无
                 // hidden 位），再取 dynsym 后者。宿主 qsort 不稳定序的实测近似：
                 // arm 9 样本与 riscv64 4 样本上均为最优。
+                // mips：无 symtab → sorted_syms=dynsym 稳定序（glibc qsort=merge
+                // sort），全平手时保表序 → 取 dynsym **首个**（@GLIBC_2.0 早于
+                // @@GLIBC_2.2.3 出现）。
                 rows.sort_by(|a, b| {
                     (a.0, a.1, a.2)
                         .cmp(&(b.0, b.1, b.2))
                         .then(b.3.cmp(&a.3)) // @@（默认版本）优先于 @（hidden）
                         .then(b.4.cmp(&a.4))
                 });
+                if is_mips {
+                    // 撤销 @@/表序二级排序，回到 compare_symbols 稳定序：全平手
+                    // （同名同 size 同 bind）取 dynsym 首个
+                    let head = rows[0].clone();
+                    let tie_all_same = rows
+                        .iter()
+                        .all(|r| (r.0, r.1, r.2) == (head.0, head.1, head.2));
+                    if tie_all_same {
+                        let first = rows.iter().min_by_key(|r| r.4).unwrap();
+                        m.insert(addr, first.5.clone());
+                        continue;
+                    }
+                }
                 m.insert(addr, rows.remove(0).5);
             }
             m
@@ -377,7 +415,31 @@ impl Libc {
             v.dedup();
             v
         };
-        Ok(Libc { data, segments, arch, mips_el,
+        // mips：objdump -d 端点表（dynsym FUNC）+ AX section 序。
+        // sh_flags & SHF_EXECINSTR 的 section（.text/.MIPS.stubs/__libc_freeres_fn/…）。
+        let mips_func_starts: Vec<u64> = {
+            let mut v: Vec<u64> = elf
+                .dynsyms
+                .iter()
+                .filter(|s| s.st_value != 0 && s.is_function())
+                .map(|s| s.st_value)
+                .collect();
+            v.sort_unstable();
+            v.dedup();
+            v
+        };
+        let mips_code_sections: Vec<(u64, u64)> = {
+            let mut v: Vec<(u64, u64)> = elf
+                .section_headers
+                .iter()
+                .filter(|sh| sh.sh_flags as u32 & goblin::elf::section_header::SHF_EXECINSTR != 0)
+                .map(|sh| (sh.sh_addr, sh.sh_size))
+                .filter(|&(addr, _)| addr != 0)
+                .collect();
+            v.sort_unstable();
+            v
+        };
+        Ok(Libc { data, segments, arch, mips_el, mips_arch_level,
             symbol_names,
             symbols_versioned,
             symbol_addrs,
@@ -387,6 +449,8 @@ impl Libc {
             build_id,
             arm_isa_chunks,
             arm_sym_starts,
+            mips_func_starts,
+            mips_code_sections,
             imports_glibc,
         })
     }

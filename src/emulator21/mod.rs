@@ -15,6 +15,7 @@ pub mod processor;
 pub mod mixins;
 pub mod aarch64;
 pub mod arm;
+pub mod mips;
 pub mod riscv64;
 
 /// 一个符号值：整数、寄存器表达式、call 目标字符串或「被 call 破坏」哨兵。

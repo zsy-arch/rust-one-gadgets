@@ -10,6 +10,7 @@
 
 pub mod aarch64;
 pub mod arm;
+pub mod mips;
 pub mod riscv64;
 
 use crate::elf::Libc;
@@ -44,6 +45,26 @@ pub trait ArchSearch {
     fn process(&self, st: &mut crate::emulator21::processor::State, line: &str) -> bool;
     /// 一次 find() 的开始（arm：装载 libc 字节供 literal pool 读取）。
     fn begin(&self, _libc: &Libc) {}
+    /// 反汇编行的 fetcher 改写（mips：name_got_calls + state_got_values）。
+    fn rewrite(&self, _libc: &Libc, lines: Vec<String>) -> Vec<String> {
+        lines
+    }
+    /// branch_pred_map 改写（mips：延迟槽边 +1）。
+    fn delay_edges(
+        &self,
+        map: HashMap<u64, Vec<usize>>,
+        _starts: &HashSet<usize>,
+    ) -> HashMap<u64, Vec<usize>> {
+        map
+    }
+    /// executed_windows 过滤（mips：三过滤）。
+    fn filter_windows(&self, _libc: &Libc, wins: Vec<Vec<String>>) -> Vec<Vec<String>> {
+        wins
+    }
+    /// 模拟行准备（mips：终端 call 后补延迟槽行）。
+    fn emulate_lines(&self, _ctx: &SearchCtx, lines: &[String]) -> Vec<String> {
+        lines.to_vec()
+    }
     /// 候选级准备（arm：note_instruction_set + GOT 基址寄存器播种）。
     /// 返回被播种的寄存器名（resolve 时前置 GOT 约束）。
     fn prepare(
@@ -54,8 +75,15 @@ pub trait ArchSearch {
     ) -> Vec<String> {
         Vec::new()
     }
-    /// resolve 后约束修正（arm：GOT 基址约束前置 + writable:reg 剔除）。
-    fn fixup(&self, _gots: &[String], _constraints: &mut Vec<String>) {}
+    /// resolve 后约束修正（arm：GOT 基址约束前置 + writable:reg 剔除；
+    /// mips：got_preconditions + gp 根 writable/readable 剔除）。
+    fn fixup(
+        &self,
+        _st: &crate::emulator21::processor::State,
+        _gots: &[String],
+        _constraints: &mut Vec<String>,
+    ) {
+    }
 }
 
 /// prepare 的搜索上下文（全行表 + 窗口起点 + 地址索引）。
@@ -94,6 +122,7 @@ impl<'a> Searcher<'a> {
             Some(sites) if !sites.is_empty() => windowed(libc, arch, &sites),
             _ => (arch.disasm(libc, 0, u64::MAX), HashSet::new()),
         };
+        let lines = arch.rewrite(libc, lines);
         let addr_at: Vec<u64> = lines
             .iter()
             .map(|l| {
@@ -104,7 +133,7 @@ impl<'a> Searcher<'a> {
             .collect();
         let index: HashMap<u64, usize> =
             addr_at.iter().enumerate().map(|(i, &a)| (a, i)).collect();
-        // branch_pred_map：一遍扫描全部分支行
+        // branch_pred_map：一遍扫描全部分支行（mips：边 +1 = 延迟槽出发）
         let mut branch_pred_map: HashMap<u64, Vec<usize>> = HashMap::new();
         for (i, line) in lines.iter().enumerate() {
             if let Some((kind, tgt)) = arch.branch_kind(line) {
@@ -113,6 +142,7 @@ impl<'a> Searcher<'a> {
                 }
             }
         }
+        let branch_pred_map = arch.delay_edges(branch_pred_map, &window_starts);
         Searcher { libc, arch, lines, addr_at, index, window_starts, branch_pred_map }
     }
 
@@ -123,7 +153,9 @@ impl<'a> Searcher<'a> {
         let mut seen: HashSet<String> = HashSet::new();
         let mut refused: HashSet<String> = HashSet::new();
         for cand in self.candidates() {
-            for suffix in executed_windows(&cand) {
+            let wins = executed_windows(&cand);
+            let wins = self.arch.filter_windows(self.libc, wins);
+            for suffix in wins {
                 let key = suffix.join("\n");
                 if !seen.insert(key) {
                     continue;
@@ -275,8 +307,9 @@ fn resolve_suffix(&self, lines: &[String]) -> Result<Option<Gadget>, ()> {
     let ctx = SearchCtx { lines: &self.lines, window_starts: &self.window_starts, index: &self.index };
     let mut st = arch.new_state();
     let gots = arch.prepare(&mut st, &ctx, lines);
+    let lines = arch.emulate_lines(&ctx, lines);
     let mut reached_call = false;
-    for l in lines {
+    for l in &lines {
         if !arch.process(&mut st, l) {
             if let Some(r) = st.refused_line.clone() {
                 LAST_REFUSED.replace(Some(r));
@@ -307,9 +340,9 @@ fn resolve_suffix(&self, lines: &[String]) -> Result<Option<Gadget>, ()> {
             u64::from_str_radix(&s[..end], 16).unwrap_or(0)
         })
         .unwrap_or(0);
-    // master：prune_settled 在 Gadget 构造器内执行；arm 的 GOT 约束前置
+    // master：prune_settled 在 Gadget 构造器内执行；arm/mips 的 resolve 覆写
     let mut constraints = gadget21::prune_settled(constraints);
-    arch.fixup(&gots, &mut constraints);
+    arch.fixup(&st, &gots, &mut constraints);
     Ok(Some(Gadget::new(offset, effect, constraints)))
 }
 }

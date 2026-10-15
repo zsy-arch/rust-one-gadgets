@@ -296,7 +296,7 @@ impl ArchSearch for ArmSearch {
         seeded
     }
 
-    fn fixup(&self, gots: &[String], constraints: &mut Vec<String>) {
+    fn fixup(&self, _st: &State, gots: &[String], constraints: &mut Vec<String>) {
         if gots.is_empty() {
             return;
         }

@@ -78,6 +78,10 @@ struct Cli {
     /// 开发用：riscv64 textgen 与 GT 行流比对
     #[arg(long = "rv64-gt-check", hide = true)]
     rv64_gt_check: bool,
+
+    /// 开发用：mips textgen 与 GT 全量行流比对
+    #[arg(long = "mips-gt-check", hide = true)]
+    mips_gt_check: bool,
 }
 
 fn main() {
@@ -90,6 +94,11 @@ fn main() {
 
     if cli.rv64_gt_check {
         rv64_gt_check(&cli.file.clone().unwrap_or_default());
+        return;
+    }
+
+    if cli.mips_gt_check {
+        mips_gt_check(&cli.file.clone().unwrap_or_default());
         return;
     }
 
@@ -227,6 +236,9 @@ fn gadgets_from_file_scan(file: &str, level: u32) -> Vec<gadget::Gadget> {
             elf::Arch::Arm => search21::Searcher::new(&libc, &search21::arm::ArmSearch).find(),
             elf::Arch::Riscv64 => {
                 search21::Searcher::new(&libc, &search21::riscv64::Riscv64Search).find()
+            }
+            elf::Arch::Mips => {
+                search21::Searcher::new(&libc, &search21::mips::MipsSearch).find()
             }
             _ => {
                 eprintln!("rog: arch {:?} not yet supported by search21", libc.arch);
@@ -425,4 +437,50 @@ fn rv64_gt_check(file: &str) {
         }
     }
     println!("TOTAL {bad}/{total} ({:.3}% bad)", bad as f64 * 100.0 / total as f64);
+}
+
+/// 开发工具：mips textgen 与 /tmp/mips_full_<name>.txt 的 objdump 全量行流比对。
+#[allow(dead_code)]
+fn mips_gt_check(file: &str) {
+    let data = std::fs::read(file).unwrap();
+    let libc = crate::elf::Libc::parse(data).unwrap();
+    let gt_file = format!(
+        "/tmp/mips_full_{}.txt",
+        std::path::Path::new(file).file_name().unwrap().to_str().unwrap()
+    );
+    let gt: Vec<String> = std::fs::read_to_string(&gt_file)
+        .unwrap()
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(|l| l.trim_start().to_string())
+        .collect();
+    // objdump -d 逐 AX section 反汇编（.text/.MIPS.stubs/__libc_freeres_fn/…）
+    let mut got: Vec<String> = Vec::new();
+    for &(saddr, ssize) in &libc.mips_code_sections {
+        got.extend(crate::textgen::mips::disassemble_range(
+            &libc,
+            saddr,
+            saddr + ssize,
+        ));
+    }
+    let mut bad = 0usize;
+    let mut shown = 0usize;
+    for (g, want) in got.iter().zip(gt.iter()) {
+        let want_clean = want.split('#').next().unwrap_or(want).trim_end();
+        let g_clean = g.split('#').next().unwrap_or(g).trim_end();
+        if g_clean != want_clean {
+            bad += 1;
+            if shown < 4000 {
+                println!("WANT: {want_clean}\n GOT: {g_clean}\n");
+                shown += 1;
+            }
+        }
+    }
+    println!(
+        "TOTAL {bad}/{} ({:.3}% bad) len got={} want={}",
+        gt.len(),
+        bad as f64 * 100.0 / gt.len().max(1) as f64,
+        got.len(),
+        gt.len()
+    );
 }

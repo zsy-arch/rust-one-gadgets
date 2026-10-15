@@ -199,6 +199,10 @@ pub struct State {
     pub(crate) prev_addr: u64,
     /// arm：当前行的 literal pool 地址（pc 相对 ldr 用）。
     pub(crate) literal: Option<u64>,
+    /// mips：持回的转移（延迟槽语义：(mnemonic, body)）。
+    pub(crate) delayed: Option<(String, String)>,
+    /// mips：GOT 槽值注释（`# <addr>`，state_got_values 注入；load_value 读）。
+    pub(crate) got_value: Option<i64>,
 }
 
 impl State {
@@ -222,6 +226,8 @@ impl State {
             thumb: false,
             prev_addr: 0,
             literal: None,
+            delayed: None,
+            got_value: None,
         }
     }
 
@@ -409,8 +415,9 @@ impl State {
                 if idx < 4 {
                     self.registers.get(&format!("a{idx}"))
                 } else {
-                    // o32：栈槽从 sp+0 起含寄存器参数槽
-                    self.stack_get_val(&Lambda::reg(&self.sp).add((idx as i64 - 4) * self.size_t()).deref())
+                    // master mips.rb：`top + idx * size_t` —— o32 为每个参数保留
+                    // 栈槽（含前 4 个寄存器参数的 caller 侧槽位）
+                    self.stack_get_val(&Lambda::reg(&self.sp).add(idx as i64 * self.size_t()).deref())
                 }
             }
             AbiArch::Amd64 => match idx {
