@@ -10,6 +10,7 @@
 
 pub mod aarch64;
 pub mod arm;
+pub mod riscv64;
 
 use crate::elf::Libc;
 use crate::emulator21::processor::is_terminal_call;

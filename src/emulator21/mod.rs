@@ -15,6 +15,7 @@ pub mod processor;
 pub mod mixins;
 pub mod aarch64;
 pub mod arm;
+pub mod riscv64;
 
 /// 一个符号值：整数、寄存器表达式、call 目标字符串或「被 call 破坏」哨兵。
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -256,11 +257,11 @@ pub fn parse_val(arg: &str, predefined: &HashMap<String, Val>) -> Result<Val, ()
         return Ok(Val::Lambda(l));
     }
     let (base, disp) = mem_obj(arg)?;
-    let obj_val = match predefined.get(base) {
+    let obj_val = match predefined.get(base.as_str()) {
         Some(Val::Lambda(l)) => Val::Lambda(l.clone()),
         Some(Val::Int(i)) => Val::Int(*i),
         // 未定义或 Str（call 目标，call 后 pc 寄存器）：当新基
-        _ => Val::Lambda(Lambda::reg(base)),
+        _ => Val::Lambda(Lambda::reg(&base)),
     };
     Ok(match obj_val {
         Val::Int(c) => Val::Int(c + disp),
@@ -275,16 +276,35 @@ pub fn parse_val(arg: &str, predefined: &HashMap<String, Val>) -> Result<Val, ()
 }
 
 /// `reg` / `reg±imm` / `reg, imm` 拆分（Ruby mem_obj 的 token 化语义）。
-fn mem_obj(arg: &str) -> Result<(&str, i64), ()> {
-    let tokens: Vec<&str> = arg
-        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '+' || c == '-'))
-        .filter(|t| !t.is_empty())
-        .collect();
+fn mem_obj(arg: &str) -> Result<(String, i64), ()> {
+    // Ruby：gsub(/[+-]/, ' \0') 在符号前断词，再 scan(/[+\-\w]+/)
+    let mut tokens: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut prev_sign = false;
+    for c in arg.chars() {
+        if c == '+' || c == '-' {
+            if !cur.is_empty() {
+                tokens.push(std::mem::take(&mut cur));
+            }
+            cur.push(c);
+            prev_sign = true;
+        } else if c.is_ascii_alphanumeric() || c == '_' {
+            cur.push(c);
+            prev_sign = false;
+        } else if !cur.is_empty() {
+            tokens.push(std::mem::take(&mut cur));
+            prev_sign = false;
+        }
+    }
+    if !cur.is_empty() {
+        tokens.push(cur);
+    }
+    let _ = prev_sign;
     match tokens.as_slice() {
-        [t] => Ok((t, 0)),
+        [t] => Ok((t.clone(), 0)),
         [base, disp] => {
             let d = crate::lambda::parse_int_str(disp).ok_or(())?;
-            Ok((base, d))
+            Ok((base.clone(), d))
         }
         _ => Err(()),
     }

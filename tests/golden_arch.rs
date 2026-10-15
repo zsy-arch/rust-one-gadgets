@@ -188,3 +188,69 @@ fn arm_glibc_smoke() {
     }
     assert!(checked > 0, "no arm samples found");
 }
+
+/// riscv64 黄金偏移表（master 2.1.1 对 4 个 riscv64 样本 -l 0/-l 1 --raw 实测；
+/// pretty 输出亦逐字节一致）。
+const GOLDEN_RISCV64_L0: &[(&str, &[u64])] = &[
+    ("libc-2.39.so", &[653114, 653116, 653176, 744156]),
+    ("libc-2.39-0ubuntu8.9.so", &[652250, 652252, 652312, 743336]),
+    ("libc-2.41-6ubuntu1.2.so", &[680660, 680662, 680720]),
+    ("libc-2.43-2ubuntu2.4.so", &[304722, 687002, 687004, 687072]),
+];
+
+const GOLDEN_RISCV64_L1: &[(&str, &[u64])] = &[
+    ("libc-2.39.so", &[290290, 290322, 290336, 290340, 290342, 290346, 290350, 290352, 290354, 290364, 402908, 402920, 402924, 402926, 402930, 402934, 402938, 402942, 402954, 653014, 653036, 653042, 653048, 653050, 653088, 653094, 653098, 653114, 653116, 653176, 653196, 653200, 653204, 653208, 653212, 743266, 743268, 744156]),
+    ("libc-2.39-0ubuntu8.9.so", &[290310, 290342, 290356, 290360, 290362, 290366, 290370, 290372, 290374, 290384, 401976, 401988, 401992, 401994, 401998, 402002, 402006, 402010, 402022, 652150, 652172, 652178, 652184, 652186, 652224, 652230, 652234, 652250, 652252, 652312, 652332, 652336, 652340, 652344, 652348, 742446, 742448, 743336]),
+    ("libc-2.41-6ubuntu1.2.so", &[296932, 296964, 296978, 296982, 296986, 296990, 296994, 296998, 297000, 297002, 424006, 424020, 424024, 424028, 424032, 424036, 424040, 424044, 424048, 424052, 680560, 680582, 680588, 680594, 680600, 680634, 680638, 680642, 680644, 680646, 680648, 680660, 680662, 680720, 680740, 680744, 680748, 680752, 680756, 772218, 772346, 772348, 772350, 772352, 772354]),
+    ("libc-2.43-2ubuntu2.4.so", &[304714, 304718, 304722, 304732, 304734, 304738, 304742, 304744, 304748, 304752, 304754, 304756, 304758, 426676, 426680, 426684, 426696, 426698, 426702, 426706, 426710, 426714, 426718, 426722, 686904, 686924, 686936, 686940, 686972, 686976, 686980, 686984, 686986, 686988, 687002, 687004, 687064, 687068, 687072, 687092, 687096, 687100, 687104, 687108, 782084, 782232, 782234, 782236, 782238]),
+];
+
+fn check_golden_riscv64(level: u32, golden: &[(&str, &[u64])]) {
+    let dir = samples_dir().join("glibc/riscv64");
+    if !dir.exists() {
+        eprintln!("samples dir missing: {} — skipping", dir.display());
+        return;
+    }
+    for (name, want) in golden {
+        let p = dir.join(name);
+        if !p.exists() {
+            panic!("sample missing: {}", p.display());
+        }
+        let got = run_rog(&p, level);
+        let got_offsets: Vec<u64> =
+            got.split_whitespace().map(|s| s.parse().unwrap()).collect();
+        assert_eq!(&got_offsets, want, "{name} l{level}: offsets diverge from master");
+    }
+}
+
+#[test]
+fn riscv64_glibc_golden_l0() {
+    check_golden_riscv64(0, GOLDEN_RISCV64_L0);
+}
+
+#[test]
+fn riscv64_glibc_golden_l1() {
+    check_golden_riscv64(1, GOLDEN_RISCV64_L1);
+}
+
+/// 冒烟：每个 riscv64 glibc 样本 l1 都能跑完且产出非空 gadget 集。
+#[test]
+fn riscv64_glibc_smoke() {
+    let dir = samples_dir().join("glibc/riscv64");
+    if !dir.exists() {
+        eprintln!("samples dir missing: {} — skipping", dir.display());
+        return;
+    }
+    let mut checked = 0;
+    for entry in std::fs::read_dir(&dir).expect("read riscv64 dir").flatten() {
+        let p = entry.path();
+        if p.extension().is_none_or(|e| e != "so") {
+            continue;
+        }
+        let got = run_rog(&p, 1);
+        let n = got.split_whitespace().count();
+        assert!(n > 0, "{} produced no gadgets", p.display());
+        checked += 1;
+    }
+    assert!(checked >= 4, "expected >=4 riscv64 samples, checked {checked}");
+}
