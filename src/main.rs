@@ -74,6 +74,10 @@ struct Cli {
     /// 开发用：arm textgen 与 master objdump 行流比对（FILE 为窗口 GT 文件目录）
     #[arg(long = "arm-gt-check", hide = true)]
     arm_gt_check: bool,
+
+    /// 开发用：riscv64 textgen 与 GT 行流比对
+    #[arg(long = "rv64-gt-check", hide = true)]
+    rv64_gt_check: bool,
 }
 
 fn main() {
@@ -81,6 +85,11 @@ fn main() {
 
     if cli.arm_gt_check {
         arm_gt_check(&cli.file.clone().unwrap_or_default());
+        return;
+    }
+
+    if cli.rv64_gt_check {
+        rv64_gt_check(&cli.file.clone().unwrap_or_default());
         return;
     }
 
@@ -344,7 +353,65 @@ fn arm_gt_check(file: &str) {
         for (g, want) in got.iter().zip(w.iter()) {
             if g != want {
                 bad += 1;
-                if shown < 10 {
+                if shown < 10000 {
+                    println!("WANT: {want}\n GOT: {g}\n");
+                    shown += 1;
+                }
+            }
+        }
+        if got.len() != w.len() {
+            println!("LEN: got {} want {}", got.len(), w.len());
+        }
+    }
+    println!("TOTAL {bad}/{total} ({:.3}% bad)", bad as f64 * 100.0 / total as f64);
+}
+
+/// 开发工具：riscv64 textgen 输出与 /tmp/rv64_gt 的 objdump 行流逐行比对。
+#[allow(dead_code)]
+fn rv64_gt_check(file: &str) {
+    let data = std::fs::read(file).unwrap();
+    let libc = crate::elf::Libc::parse(data).unwrap();
+    let gt_file = format!(
+        "/tmp/rv64_gt/{}.txt",
+        std::path::Path::new(file).file_name().unwrap().to_str().unwrap()
+    );
+    let gt: Vec<(bool, String)> = std::fs::read_to_string(&gt_file)
+        .unwrap()
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(|l| match l.strip_prefix('W') {
+            Some(r) => (true, r.trim_start().to_string()),
+            None => (false, l.trim_start().to_string()),
+        })
+        .collect();
+    let mut windows: Vec<Vec<String>> = vec![];
+    for (is_start, line) in gt {
+        if is_start {
+            windows.push(vec![]);
+        }
+        windows.last_mut().unwrap().push(line);
+    }
+    let mut bad = 0usize;
+    let mut shown = 0usize;
+    let mut total = 0usize;
+    for w in &windows {
+        let first_addr = u64::from_str_radix(w[0].split(':').next().unwrap(), 16).unwrap();
+        let last_addr = u64::from_str_radix(w.last().unwrap().split(':').next().unwrap(), 16).unwrap();
+        let last = w.last().unwrap();
+        let last_body = last.split_once('\t').map(|(_, r)| r).unwrap_or("");
+        let tail = if last_body.starts_with(".short") || last_body.starts_with(".insn 2") {
+            2
+        } else {
+            4
+        };
+        let got = crate::textgen::riscv64::disassemble_range(&libc, first_addr, last_addr + tail);
+        total += w.len();
+        for (g, want) in got.iter().zip(w.iter()) {
+            let want_clean = want.split('#').next().unwrap_or(want).trim_end();
+            let g_clean = g.split('#').next().unwrap_or(g).trim_end();
+            if g_clean != want_clean {
+                bad += 1;
+                if shown < 10000 {
                     println!("WANT: {want}\n GOT: {g}\n");
                     shown += 1;
                 }

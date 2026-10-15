@@ -284,25 +284,83 @@ impl Libc {
                 }
             }
         }
+        // riscv64：objdump（bfd elf64_riscv_get_synthetic_symtab）的 @plt 合成符号。
+        // 布局：PLT0(16B) + N×16B（auipc t3 / ld t3,imm(t3) / jalr t3 / nop）。
+        // GOT slot = (auipc 高 20 位 << 12) + pc + (ld 低 12 位)。
+        if arch == crate::elf::Arch::Riscv64 {
+            if let Some(sh) = elf
+                .section_headers
+                .iter()
+                .find(|sh| elf.shdr_strtab.get_at(sh.sh_name) == Some(".plt"))
+            {
+                let (base, off, size) = (sh.sh_addr as u64, sh.sh_offset as usize, sh.sh_size as usize);
+                if off + size <= data.len() && size > 16 {
+                    let bytes = &data[off..off + size];
+                    let word = |o: usize| u32::from_le_bytes(bytes[o..o + 4].try_into().unwrap());
+                    let mut slot_map = std::collections::HashMap::new();
+                    for r in elf.pltrelocs.iter() {
+                        if r.r_sym == 0 {
+                            continue;
+                        }
+                        if let Some(sym) = elf.dynsyms.get(r.r_sym) {
+                            if let Some(name) = elf.dynstrtab.get_at(sym.st_name) {
+                                slot_map.entry(r.r_offset).or_insert_with(|| name.to_string());
+                            }
+                        }
+                    }
+                    let sext20 = |v: u32| -> i64 { (((v << 12) as i32) >> 12) as i64 };
+                    let mut a = 16usize; // 跳过 PLT0
+                    while a + 16 <= size {
+                        let (w1, w2, w3) = (word(a), word(a + 4), word(a + 8));
+                        // auipc t3, imm 与 ld t3, imm(t3) 的配对
+                        if w1 & 0x7f == 0x17
+                            && ((w1 >> 7) & 0x1f) == 28
+                            && w2 & 0x7f == 0x03
+                            && ((w2 >> 7) & 0x1f) == 28
+                            && ((w2 >> 12) & 7) == 3
+                            && w3 & 0x7f == 0x67
+                        {
+                            let hi = sext20(w1 >> 12);
+                            let lo = (((w2 >> 20) as i32) << 20) >> 20; // 12 位符号扩展
+                            let slot = (base + a as u64).wrapping_add_signed(hi * 0x1000 + lo as i64);
+                            if let Some(name) = slot_map.get(&slot) {
+                                symbol_names.insert(base + a as u64, format!("{name}@plt"));
+                            }
+                        }
+                        a += 16;
+                    }
+                }
+            }
+        }
         let symbols_versioned: std::collections::HashMap<u64, String> = {
             // (非 GLOBAL? -size, 裸名) 排序取第一 —— objdump compare_symbols 原样
             // （裸名排序：带 @@ 版本后缀的串会破坏字典序，如 memset4@@ < memset@@）
-            let mut by_addr: std::collections::HashMap<u64, Vec<(bool, i64, &str, usize, String)>> =
-                std::collections::HashMap::new();
+            let mut by_addr: std::collections::HashMap<
+                u64,
+                Vec<(bool, i64, &str, bool, usize, String)>,
+            > = std::collections::HashMap::new();
             for (sv, annotated, name, is_global, size, idx) in &alias_rows {
-                by_addr
-                    .entry(*sv)
-                    .or_default()
-                    .push((!*is_global, -(*size as i64), name.as_str(), *idx, annotated.clone()));
+                by_addr.entry(*sv).or_default().push((
+                    !*is_global,
+                    -(*size as i64),
+                    name.as_str(),
+                    annotated.contains("@@"),
+                    *idx,
+                    annotated.clone(),
+                ));
             }
             let mut m = std::collections::HashMap::new();
             for (addr, mut rows) in by_addr {
-                // 同名同 size 的全平手（同名多版本）：取 dynsym **后者**。
-                // 理论上 find_symbol_for_address 是 first-equal（稳定序=先者），
-                // 但宿主 qsort 不稳定序使个别文件翻转；实测「后者」在 9 样本
-                // 上净差最小（6/174735 行，__libc_start_main 双版本组）。
-                rows.sort_by(|a, b| (a.0, a.1, a.2).cmp(&(b.0, b.1, b.2)).then(b.3.cmp(&a.3)));
-                m.insert(addr, rows.remove(0).4);
+                // 同名同 size 的全平手（同名多版本）：先取**默认版本**（@@，无
+                // hidden 位），再取 dynsym 后者。宿主 qsort 不稳定序的实测近似：
+                // arm 9 样本与 riscv64 4 样本上均为最优。
+                rows.sort_by(|a, b| {
+                    (a.0, a.1, a.2)
+                        .cmp(&(b.0, b.1, b.2))
+                        .then(b.3.cmp(&a.3)) // @@（默认版本）优先于 @（hidden）
+                        .then(b.4.cmp(&a.4))
+                });
+                m.insert(addr, rows.remove(0).5);
             }
             m
         };
@@ -398,7 +456,15 @@ impl Libc {
                 self.symbol_names.get(&a).cloned().unwrap_or_default()
             }
             Some(a) => {
-                let name = if self.arch == crate::elf::Arch::Arm {
+                // 非 x86（2.1.1 管线）注释走 objdump compare_symbols 语义：
+                // 别名组胜者（带版本注解），回落裸名。x86 走 1.10.0 老注释路径。
+                let name = if matches!(
+                    self.arch,
+                    crate::elf::Arch::Arm
+                        | crate::elf::Arch::Riscv64
+                        | crate::elf::Arch::Aarch64
+                        | crate::elf::Arch::Mips
+                ) {
                     self.symbols_versioned
                         .get(&a)
                         .or_else(|| self.symbol_names.get(&a))
