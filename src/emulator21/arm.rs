@@ -36,7 +36,7 @@ pub(crate) const INSTRUCTIONS: &[(&str, usize, usize)] = &[
     ("svc", 1, 1),
 ];
 
-/// 目标 libc 字节（literal pool 读取）。find() 开始时设置一次。
+// 目标 libc 字节（literal pool 读取）。find() 开始时设置一次。
 thread_local! {
     static FILE: RefCell<Option<Rc<Vec<u8>>>> = const { RefCell::new(None) };
 }

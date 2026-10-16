@@ -530,10 +530,19 @@ impl State {
         if self.constraints.is_empty() {
             return vec![];
         }
-        // 排序（地址约束 deref0 按 imm 升序在前）+ 按 (type, base) 去重取最小 offset
+        // 排序（地址约束 deref0 按 imm 升序在前）+ 全局去重保首见
+        // （master `.uniq { constraint_key }`——非相邻重复也合并，同键保 imm 最小者）
         let mut cons: Vec<CtItem> = self.constraints.clone();
         cons.sort_by(|a, b| ct_sort_key(a).cmp(&ct_sort_key(b)));
-        cons.dedup_by(|a, b| ct_key(a) == ct_key(b));
+        let mut seen: std::collections::HashSet<(u8, String)> = std::collections::HashSet::new();
+        let mut uniq: Vec<CtItem> = Vec::new();
+        for c in cons {
+            let k = ct_key(&c);
+            if seen.insert(k) {
+                uniq.push(c);
+            }
+        }
+        let cons = uniq;
         let cons = self.drop_implied_nonzero(cons);
         let cons = self.drop_restated_null(cons);
         let mut out: Vec<String> = cons.iter().map(render_ct).collect();

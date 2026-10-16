@@ -143,18 +143,49 @@ pub fn process_line(st: &mut State, cmd: &str) -> EmuResult<()> {
     if branch_mnem(mnem) {
         return handle_branch(st, mnem, rest);
     }
-    // 指令表查 + handler
-    let Some((name, lo, hi)) = INSTRUCTIONS.iter().find(|(m, _, _)| *m == mnem) else {
-        return Err(EmuError::UnsupportedInstruction(cmd.to_string()));
+    // 指令表查 + handler。
+    // 精确名未命中时走 master 的子串回退（processor.rb#parse）：
+    // `list.find { |i| i.match?(cmd) }` —— 表序首个「cmd 含 "<name>" + 空白」的
+    // 条目接手，参数从 cmd（原始行，含地址前缀）中 name 的首个出现处之后切。
+    // 例：`sh3add a5,a5,a4` 的 "add\t" 命中 add → args = ["a5","a5","a4"]
+    // （"sh3" 残留被 index 定位跳过），即 sh3add 被模拟成 add——master 兼容语义。
+    let (name, lo, hi, rest_owned): (&str, usize, usize, Option<String>) =
+        match INSTRUCTIONS.iter().find(|(m, _, _)| *m == mnem) {
+            Some((n, lo, hi)) => (*n, *lo, *hi, None),
+            None => {
+                // match?：`/#{inst}\s/` —— name 后跟任一空白（空格/tab）即命中
+                let Some((n, lo, hi)) = INSTRUCTIONS.iter().find(|(m, _, _)| {
+                    cmd.match_indices(*m).any(|(i, _)| {
+                        cmd.as_bytes().get(i + m.len()).is_some_and(u8::is_ascii_whitespace)
+                    })
+                }) else {
+                    return Err(EmuError::UnsupportedInstruction(cmd.to_string()));
+                };
+                // fetch_args 语义：idx 取原始 cmd 的首个出现；再剥 // 与 # 尾注
+                // （rindex——最右出现），从 idx+name.len() 切参数。
+                let idx = cmd.find(*n).unwrap() + n.len();
+                let mut cut: &str = cmd;
+                if let Some(i) = cmd.rfind("//") {
+                    cut = &cut[..i.min(cut.len())];
+                }
+                if let Some(i) = cmd.rfind('#') {
+                    cut = &cut[..i.min(cut.len())];
+                }
+                let cut = cut.get(idx..).unwrap_or("");
+                (n, *lo, *hi, Some(cut.to_string()))
+            }
+        };
+    let args = match &rest_owned {
+        Some(r) => operands(r),
+        None => operands(rest),
     };
-    let args = operands(rest);
-    if args.len() < *lo || args.len() > *hi {
+    if args.len() < lo || args.len() > hi {
         return Err(EmuError::InstructionArgument(format!(
             "Incorrect argument number in {cmd}, expect: {lo}..{hi}"
         )));
     }
     let refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-    match *name {
+    match name {
         "add" | "addi" => inst_arith(st, true, &refs),
         "sub" => inst_arith(st, false, &refs),
         "mv" => inst_mv(st, &refs),

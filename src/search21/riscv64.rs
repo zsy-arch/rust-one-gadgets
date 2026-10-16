@@ -206,16 +206,3 @@ mod tests {
         assert_eq!(s.branch_kind("0:\tadd\ta5,a5,a4"), None);
     }
 }
-
-
-
-
-
-
-
-
-
-
-
-
-

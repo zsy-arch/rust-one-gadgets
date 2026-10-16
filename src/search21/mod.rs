@@ -175,10 +175,15 @@ impl<'a> Searcher<'a> {
     }
 
     /// branch_aware_candidates：每个终端 call 反向 walk。
+    /// 起点 = 宽松 terminal_call_regexp（`call_str.*<(exec[^+]*|posix_spawn[^+]*)>$`，
+    /// 即 <名> 以 exec/posix_spawn 开头且不含 '+'——versioned 符号 '@' 后到 '>' 前
+    /// 无 '+'；posix_spawn_file_actions_* 等前缀符号也命中），模拟/emulation 内部
+    /// 仍用严格 TERMINAL_CALL_RE。master 两条判定本就不同：宽松版扩窗口候选，
+    /// 严格版定模拟终点。
     fn candidates(&self) -> Vec<Vec<String>> {
         let mut cands: Vec<Vec<String>> = Vec::new();
         for (idx, line) in self.lines.iter().enumerate() {
-            if self.arch.call_addr(line).is_some() && self.terminal_call_line(line) {
+            if self.arch.call_addr(line).is_some() && self.loose_terminal_call(line) {
                 let mut visited = HashSet::new();
                 let mut path: Vec<usize> = Vec::new();
                 self.back_walk(idx, 0, &mut visited, &mut path, &mut cands);
@@ -249,15 +254,17 @@ impl<'a> Searcher<'a> {
         preds
     }
 
-    /// terminal_call_line：call 且 <name> 匹配 TERMINAL_CALL_RE。
-    fn terminal_call_line(&self, line: &str) -> bool {
+
+    /// 宽松版（master terminal_call_regexp）：call 行的 <名> 以 exec/posix_spawn
+    /// 开头且到 '>' 为止无 '+'（glibc versioned 符号 `<posix_spawn@@GLIBC_2.27>`
+    /// 的 '+' 前缀段不含 '+'；musl 无版本标记同样成立）。定 back_walk 起点。
+    fn loose_terminal_call(&self, line: &str) -> bool {
         let Some(addr) = self.arch.call_addr(line) else { return false };
-        if let Some(start) = addr.find('<') {
-            let name = addr[start + 1..].split('@').next().unwrap_or("");
-            let name = name.strip_suffix('>').unwrap_or(name);
-            return is_terminal_call(name);
-        }
-        false
+        let Some(start) = addr.find('<') else { return false };
+        let Some(end) = addr[start + 1..].find('>') else { return false };
+        let name = &addr[start + 1..start + 1 + end];
+        (name.starts_with("exec") || name.starts_with("posix_spawn"))
+            && !name.contains('+')
     }
 }
 
