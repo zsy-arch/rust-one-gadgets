@@ -105,6 +105,7 @@ fn main() {
     // 双代：x86 条目=1.10.0 快照（gadget::refine）；非 x86 条目=master 2.1.1
     // builds（gadget21::for_level + refine——DB 存全量，trim/all 按 level）。
     let mut gadgets = if let Some(id) = &cli.build_id {
+        // -b 走数据库：无文件可检，不标置信度
         let (g, is21) = match builds::gadgets_by_prefix(id) {
             Ok(v) => v,
             Err(e) => {
@@ -119,6 +120,10 @@ fn main() {
         }
     } else {
         let file = cli.file.as_ref().unwrap();
+        // 非 glibc 检测（musl/uClibc-ng）：扫描结果基于 glibc 布局假设的
+        // 启发式外推——stderr 标注置信度提醒（stdout 不动，保持与基准输出
+        // 逐字节可比）。
+        warn_non_glibc(file);
         let g = if !cli.force_file {
             // 先试 build-id 数据库（除非 -f）；未命中回落全量扫描。
             // 非 x86 条目：master 2.1.1 语义（for_level + refine）。
@@ -187,6 +192,41 @@ fn main() {
     }
 
     display_gadgets(&gadgets, &cli);
+}
+
+/// 非 glibc 检测：读文件前 1MB 找 musl/uClibc 标记串（musl 的 SONAME 串
+/// `libc.musl-<arch>.so.1` 与 `MUSL_LOCPATH`；uClibc 的 `__uClibc_main`）。
+/// 命中则 stderr 提示启发式置信度。glibc 不含任何标记。
+fn warn_non_glibc(file: &str) {
+    use std::io::Read;
+    let Ok(mut f) = std::fs::File::open(file) else { return };
+    let mut buf = vec![0u8; 0x10_0000.min({
+        let len = f.metadata().map(|m| m.len()).unwrap_or(0x10_0000);
+        len.max(1) as usize
+    })];
+    let Ok(n) = f.read(&mut buf) else { return };
+    let haystack = &buf[..n];
+    let flavor = if contains_sub(haystack, b"libc.musl-")
+        || contains_sub(haystack, b"MUSL_LOCPATH")
+        || contains_sub(haystack, b"musl libc (")
+    {
+        Some("musl")
+    } else if contains_sub(haystack, b"__uClibc_main") {
+        Some("uClibc")
+    } else {
+        None
+    };
+    if let Some(fl) = flavor {
+        eprintln!(
+            "[OneGadget] Note: {fl} libc detected; gadgets are heuristic \
+             (semantics extrapolated from glibc) — verify constraints before use."
+        );
+    }
+}
+
+/// 无 std 子串搜索（&[u8] windows 匹配）。
+fn contains_sub(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack.windows(needle.len()).any(|w| w == needle)
 }
 
 /// 数据库路径：读文件 build-id → 查内置库。None = 未命中（回落扫描）。
