@@ -3,8 +3,15 @@
 [one_gadget](https://github.com/david942j/one_gadget) 的高性能 Rust 重写 ——
 在 glibc 里找 `execve("/bin/sh", ...)` / `posix_spawn("/bin/sh", ...)` gadget。
 
-与 one_gadget **v1.10.0** 逐字节兼容（输出、顺序、格式完全一致），快 **~22×**，
-单二进制零依赖（不需要 Ruby / objdump）。
+双代架构，与上游**逐字节兼容**：
+
+| 架构 | libc | 基准 |
+|---|---|---|
+| amd64 / i386 | glibc、musl、uClibc-ng | one_gadget **v1.10.0** |
+| aarch64 / arm / riscv64 / mips(o32) | glibc、musl、uClibc-ng | one_gadget **master 2.1.1** |
+
+快 **~22×**（x86）/ **2–5×**（非 x86 vs master），单二进制零依赖（不需要
+Ruby / objdump）。
 
 ```
 $ rog libc-2.35-0ubuntu3.14_amd64.so -l 1
@@ -26,7 +33,8 @@ RUSTFLAGS="-C linker=rust-lld" cargo build --release --target x86_64-unknown-lin
 ```
 
 平台支持：macOS（arm64/x86_64）、Linux（x86_64/aarch64 musl 静态）。
-输入支持 **x86-64 (amd64) 与 i386** glibc。
+输入支持 **amd64 / i386 / aarch64 / arm(Thumb-2+A32) / riscv64(RV64GC) /
+mips(o32 BE/LE)** 的 **glibc、musl、uClibc-ng**。
 
 ## 用法
 
@@ -66,8 +74,8 @@ rog -s './try.sh' libc.so.6      # 逐 gadget 试 exploit
 
 ### gadget 来源优先级（对齐 one_gadget）
 
-给 FILE 时先读 ELF 的 `NT_GNU_BUILD_ID`，命中**内置数据库**（859 个上游
-预构建结果，编译期嵌入二进制）就直接用；`-f` 跳过。`-b ID` 则完全走数据库。
+给 FILE 时先读 ELF 的 `NT_GNU_BUILD_ID`，命中**内置数据库**（875 个上游
+预构建结果 = 859 x86 + 32 非 x86 master 条目，编译期嵌入）就直接用；`-f` 跳过。`-b ID` 则完全走数据库。
 
 ## 性能
 
@@ -88,12 +96,16 @@ rog 单进程完成 ELF 解析（goblin）→ iced-x86 全量**解码**（objdum
 
 ## 正确性
 
-- **golden 回归测试**（`tests/golden.rs`）：36 个 libc（amd64 + i386）×
-  level 0/1/2 共 **108 组**输出与 one_gadget v1.10.0 **逐字节一致**
-  （含约束文本、顺序、空行）。
+- **golden 回归测试**（`tests/golden.rs` + `tests/golden_arch.rs`）：
+  - x86：36 个 glibc（amd64 + i386）× level 0/1/2 共 **108 组**与 1.10.0
+    **逐字节一致**（含约束文本、顺序、空行）；
+  - 非 x86：glibc 28 样本（aarch64/arm/riscv64/mips/mipsel）× l0/l1/l2
+    **84 组**与 master 2.1.1 逐字节一致；musl 18 + uClibc 7 样本全过
+    （非 x86 对 master、x86 对 1.10.0）。
 - **CLI 特性测试**（`tests/cli.rs`）：build-id 数据库、`--info`、`--near`、
   `-f`、`--script`、json 输出。
-- 40+ 单元测试覆盖 Lambda 解析/渲染、模拟器指令语义（双架构）、评分与过滤。
+- 130+ 单元测试覆盖 Lambda 解析/渲染、模拟器指令语义（7 架构管线）、
+  评分与过滤。
 - 已在 macOS arm64、Linux x86_64（musl）、Linux aarch64（musl）上验证；
   容器内与 gem 1.10.0 做 108 组对照全部一致。
 
@@ -104,14 +116,19 @@ cargo test          # 单元 + golden + cli（testdata 需在仓库内）
 ## 架构
 
 ```
-elf (goblin: 段/符号/版本符号/bin_sh/build-id/PLTGOT)
- → disasm (iced-x86 解码元数据; objdump 行文本按需渲染; 32/64 位)
- → search (grep -B30 基本块 + amd64 jmp_case 候选; i386 rel_sh 过滤)
- → emulator (13 条指令符号执行; Lambda 值; sp/bp 栈表; amd64/i386)
- → resolver (execve/execl/posix_spawn 参数 → 约束; i386 GOT 基寄存器)
- → builds (内置 859 条 build-id 数据库, -b/--info/文件优先路径)
- → near (--near 函数距离排序 / ELF GOT 函数集)
- → gadget (trim 去重/剔除超集/排序 → level 过滤 → pretty/raw/json)
+x86（1.10.0 语义）:
+elf → disasm (iced-x86) → search (grep -B30/jmp_case) → emulator (13 指令)
+    → resolver → gadget (trim → level → pretty/raw/json)
+
+非 x86（master 2.1.1 语义）:
+elf → textgen (aarch64/arm[t thumb+A32]/riscv64[RVC·扩展]/mips[o32] 全量解码)
+    → search21 (宽松 terminal 起点反向 walk → executed windows)
+    → emulator21 (符号执行; 架构寄存器/延迟槽/GOT 播种)
+    → resolve21 (execve/posix_spawn 参数 → 约束; prune_settled)
+    → gadget21 (for_level[trim/all] → refine; macOS qsort_r 平局序复刻)
+
+共用: builds (内置 875 条 = 859 x86 + 32 非 x86, 双代分派)
+    near (--near 函数距离排序 / ELF GOT 函数集)
 ```
 
 详细设计（含与 one_gadget 1.10.0 的语义对齐细节、已知陷阱）：
@@ -119,9 +136,12 @@ elf (goblin: 段/符号/版本符号/bin_sh/build-id/PLTGOT)
 
 ## 与 one_gadget 的差异
 
-- 远程 build-id 数据库更新提示（gem 的 `ask_update`）不做，仅用内置 859 条。
+- 远程 build-id 数据库更新提示（gem 的 `ask_update`）不做，仅用内置
+  875 条（859 条 1.10.0 快照 + 32 条 master 2.1.1 非 x86 条目）。
 - `--near` 的函数偏移取自 ELF 符号表而非 `objdump -T` 子进程（结果一致）。
-- 版本锁定 1.10.0 语义（更新版本的 one_gadget 输出未对齐）。
+- x86 锁 1.10.0 语义；非 x86 锁 master 2.1.1 语义（各自与其基准逐字节一致）。
+- 非 glibc（musl/uClibc-ng）检测：stderr 提示启发式置信度（stdout 不变），
+  提醒约束需人工复核——上游 one_gadget 同样基于 glibc 布局假设。
 
 ## License
 
