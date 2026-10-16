@@ -110,8 +110,20 @@ rog 单进程完成 ELF 解析（goblin）→ iced-x86 全量**解码**（objdum
   容器内与 gem 1.10.0 做 108 组对照全部一致。
 
 ```bash
-cargo test          # 单元 + golden + cli（testdata 需在仓库内）
+cargo test          # 单元 + golden + cli
 ```
+
+### 测试样本
+
+仓库**不含** libc 二进制（LGPL 分发 + 体积），golden 测试在样本缺失时自动跳过：
+
+- `testdata/*.so`：36 个 Ubuntu glibc（amd64 + i386，2.23–2.43）。从
+  `archive.ubuntu.com` / `ports.ubuntu.com` 的 `libc6_*` .deb 包提取
+  `libc.so.6` 后按 `<ver>-<rel>_<arch>.so` 命名放入。
+- `ROG_LIBC_SAMPLES_DIR`（默认 `~/CTF/tools/rog_libc_samples`）：非 x86
+  glibc/musl/uClibc-ng 真机样本（aarch64/arm/riscv64/mips/o32），用于
+  `tests/golden_arch.rs`。
+- `testdata/golden/*.txt`：期望输出已入库（文本，1.10.0 逐字节录制）。
 
 ## 架构
 

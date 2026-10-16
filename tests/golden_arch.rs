@@ -14,9 +14,7 @@ fn samples_dir() -> PathBuf {
             PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                 .join("../../../../CTF/tools/rog_libc_samples")
                 .canonicalize()
-                .unwrap_or_else(|_| {
-                    PathBuf::from("ROG_LIBC_SAMPLES_DIR")
-                })
+                .unwrap_or_else(|_| PathBuf::from("rog_libc_samples"))
         })
 }
 
@@ -316,12 +314,14 @@ fn mips_glibc_golden_l1() {
 #[test]
 fn mips_glibc_smoke() {
     let mut checked = 0;
+    let mut any_dir = false;
     for arch_dir in ["mips", "mipsel"] {
         let dir = samples_dir().join("glibc").join(arch_dir);
         if !dir.exists() {
             eprintln!("samples dir missing: {} — skipping", dir.display());
             continue;
         }
+        any_dir = true;
         for entry in std::fs::read_dir(&dir).expect("read mips dir").flatten() {
             let p = entry.path();
             if p.extension().is_none_or(|e| e != "so") {
@@ -332,6 +332,10 @@ fn mips_glibc_smoke() {
             assert!(n > 0, "{} produced no gadgets", p.display());
             checked += 1;
         }
+    }
+    if !any_dir {
+        eprintln!("no mips sample dirs found — skipping smoke");
+        return;
     }
     assert!(checked >= 5, "expected >=5 mips samples, checked {checked}");
 }

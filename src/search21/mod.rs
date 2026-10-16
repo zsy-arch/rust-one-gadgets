@@ -393,6 +393,23 @@ fn windowed(
 }
 
 
+
+/// 样本集内相对路径 → 绝对路径（ROG_LIBC_SAMPLES_DIR 优先，回落仓库旁默认）。
+/// 找不到返回 None（测试自行跳过）。
+#[cfg(test)]
+pub(crate) fn samples_libc_path(rel: &str) -> Option<std::path::PathBuf> {
+    let dir = std::env::var_os("ROG_LIBC_SAMPLES_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../../../CTF/tools/rog_libc_samples")
+                .canonicalize()
+                .unwrap_or_else(|_| std::path::PathBuf::from("rog_libc_samples"))
+        });
+    let p = dir.join(rel);
+    p.exists().then_some(p)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -401,12 +418,9 @@ mod tests {
     /// 「能跑完且 found 集非空 + 关键 offset 在集内」的回归下限。
     #[test]
     fn searcher_finds_key_offsets_227() {
-        let dir = std::env::var_os("ROG_LIBC_SAMPLES_DIR")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| std::path::PathBuf::from(
-                "ROG_LIBC_SAMPLES_DIR",
-            ));
-        let p = dir.join("glibc/aarch64/libc-2.27.so");
+        let Some(p) = samples_libc_path("glibc/aarch64/libc-2.27.so") else {
+            return;
+        };
         let Ok(data) = std::fs::read(&p) else {
             return;
         };
@@ -419,12 +433,13 @@ mod tests {
         assert!(gadgets.iter().any(|g| g.offset == 0xa32e8), "0xa32e8 must be found");
 
         // 2.24：0x9cec8（maybe_script_execute → execvpe 内 execve）
-        let p224 = dir.join("glibc/aarch64/libc-2.24.so");
-        if let Ok(data) = std::fs::read(&p224) {
-            let libc = crate::elf::Libc::parse(data).unwrap();
-            let s = Searcher::new(&libc, &arch);
-            let g224 = s.find();
-            assert!(g224.iter().any(|g| g.offset == 0x9cec8), "0x9cec8 must be found");
+        if let Some(p224) = samples_libc_path("glibc/aarch64/libc-2.24.so") {
+            if let Ok(data) = std::fs::read(&p224) {
+                let libc = crate::elf::Libc::parse(data).unwrap();
+                let s = Searcher::new(&libc, &arch);
+                let g224 = s.find();
+                assert!(g224.iter().any(|g| g.offset == 0x9cec8), "0x9cec8 must be found");
+            }
         }
     }
 }

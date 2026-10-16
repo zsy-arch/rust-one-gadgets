@@ -81,7 +81,7 @@ ArchDef（元数据+分类）+ emulator handlers（指令语义）+ textgen（�
    → tests/golden_arch.rs。
 2. 样本集 e2e（ROG_LIBC_SAMPLES_DIR）：每 (arch × libc) ≥1 个样本
    `rog <file> -l 1` 不 panic、输出可解析、非空（uclibc 允许空但须标注）。
-3. Docker 对照：容器内跑 Ruby one_gadget master（已克隆 /tmp/og-master）
+3. Docker 对照：容器内跑 Ruby one_gadget master（one_gadget master 克隆）
    与 rog 逐字节比对（样本集全量）。
 4. 单元：conditional satisfiable、tracked_memory 回读、mips GOT 解析、
    arm thumb 判定、各 textgen 与 objdump 快照对照。

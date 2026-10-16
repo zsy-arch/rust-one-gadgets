@@ -112,12 +112,10 @@ mod tests {
         // 顺带验证 adrp 渲染为页对齐绝对地址（objdump: `adrp x0, 0x127000`）
 
         // 样本集真机 e2e：BL execve 行必须带 <execve> 尾注（call 判定依赖）
-        let dir = std::env::var_os("ROG_LIBC_SAMPLES_DIR")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| std::path::PathBuf::from(
-                "ROG_LIBC_SAMPLES_DIR",
-            ));
-        let p = dir.join("glibc/aarch64/libc-2.27.so");
+        let Some(p) = crate::search21::samples_libc_path("glibc/aarch64/libc-2.27.so") else {
+            eprintln!("sample missing — skipping");
+            return;
+        };
         let Ok(data) = std::fs::read(&p) else {
             eprintln!("sample missing: {} — skipping", p.display());
             return;

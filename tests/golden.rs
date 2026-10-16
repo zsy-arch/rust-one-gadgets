@@ -40,6 +40,11 @@ fn all_libcs() -> Vec<String> {
 #[test]
 fn golden_all_libcs_all_levels() {
     let libcs = all_libcs();
+    // 样本二进制不入库（.gitignore）：本地有才跑，CI 环境自动跳过
+    if libcs.is_empty() {
+        eprintln!("testdata/*.so 不存在 — 跳过 golden（获取方式见 README）");
+        return;
+    }
     assert!(libcs.len() >= 36, "expected >=36 test libcs, got {}", libcs.len());
 
     // debug 构建下单 libc ~0.5s：并行 8 线程压到 ~2s

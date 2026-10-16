@@ -1,12 +1,12 @@
 # 阶段性成果 ②：libc 样本集报告
 
-日期：2026-10-14。样本集位置：`ROG_LIBC_SAMPLES_DIR`。
+日期：2026-10-14。样本集位置：`$ROG_LIBC_SAMPLES_DIR`（本地样本集，默认 `~/CTF/tools/rog_libc_samples`）。
 
 ## 总量
 
 **68 个有效样本，0 个失败**（要求 ≥60 ✓）。每个样本均通过校验：
 ELF 头（arch/endian/bits 与目录一致）+ `/bin/sh\x00` 存在 + SHA256 全长记录于
-[MANIFEST.md](../../CTF/tools/rog_libc_samples/MANIFEST.md)。
+样本集内的 `MANIFEST.md`。
 
 ## 覆盖矩阵（计数 = 有效样本数）
 

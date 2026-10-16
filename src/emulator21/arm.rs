@@ -658,9 +658,19 @@ mod tests {
 
     #[test]
     fn test_pipeline_seq() {
-        crate::emulator21::arm::set_file(std::rc::Rc::new(
-            std::fs::read("ROG_LIBC_SAMPLES_DIR/glibc/arm/libc-2.27-3ubuntu1.5.so").unwrap(),
-        ));
+        // literal pool 读取需要真实 libc 字节；样本缺失时跳过（不依赖绝对路径）
+        let Some(path) = crate::search21::samples_libc_path("glibc/arm/libc-2.27-3ubuntu1.5.so") else {
+            eprintln!("sample missing, skip test_pipeline_seq");
+            return;
+        };
+        let bytes = match std::fs::read(&path) {
+            Ok(b) => b,
+            Err(_) => {
+                eprintln!("sample unreadable, skip test_pipeline_seq");
+                return;
+            }
+        };
+        crate::emulator21::arm::set_file(std::rc::Rc::new(bytes));
         let mut st = new_state();
         let lines = [
             " 2d39c:\tldr\tr2, [pc, #128]\t@ (2d420 <__strtod_nan@@GLIBC_PRIVATE+0x468>)",

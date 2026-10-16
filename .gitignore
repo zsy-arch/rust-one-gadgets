@@ -1,1 +1,3 @@
 /target
+# 测试用 libc 样本二进制不入库（LGPL 分发问题 + 体积）；获取方式见 README「测试样本」
+testdata/*.so

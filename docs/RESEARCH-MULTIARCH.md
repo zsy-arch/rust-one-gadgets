@@ -1,6 +1,6 @@
 # 调研报告：多架构 + musl/uClibc 支持
 
-日期：2026-10-14。参考实现：one_gadget **master 2.1.1**（/tmp/og-master，commit f6e57f0）。
+日期：2026-10-14。参考实现：one_gadget **master 2.1.1**（commit f6e57f0）。
 rog 现有 x86 路径对齐的是 1.10.0；新架构按 2.1.1 语义实现。
 
 ## 1. 两代框架对比（决定架构策略）
