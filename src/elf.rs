@@ -72,6 +72,9 @@ pub struct Libc {
     /// arm：objdump -d 的逐函数解码范围（不相交并集，升序）。
     /// thumb 符号范围为 [v&~1, v+st_size)（st_size 从奇数值起算 → 掩码起点多 1 字节，
     /// 产生"函数尾多解码 1 条 2 字节指令"的 objdump 行为）；函数间池/padding 不解码。
+    /// arm：.symtab 的 $a/$t/$d mapping symbols（地址升序；(addr, kind)）。
+    /// objdump 依此切 ISA 与数据段（$d → .word）；空表 = 无 symtab（stripped）。
+    pub arm_map_syms: Vec<(u64, u8)>,
     /// 未定义 dynsym 符号名（--near 的 GOT 函数集），带 GLIBC 版本。
     imports_glibc: Vec<String>,
 }
@@ -107,7 +110,18 @@ impl Libc {
         let is_mips = elf.header.e_machine == EM_MIPS;
         // 地址 → 符号名（函数与对象都留；call/rip 解引用都可能用到）
         let mut symbol_names = std::collections::HashMap::new();
-        for (syms, strtab) in [(&elf.dynsyms, &elf.dynstrtab), (&elf.syms, &elf.strtab)] {
+        // (size, name) 胜者跟踪（同地址多符号的 objdump 选择序）
+        let mut symbol_sizes: std::collections::HashMap<u64, (u64, String)> =
+            std::collections::HashMap::new();
+        let mut dynsym_addrs: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        // arm $a/$t/$d mapping symbols（objdump 的 ISA/数据切换源）
+        let mut arm_map_syms: Vec<(u64, u8)> = Vec::new();
+        for (table_idx, (syms, strtab)) in
+            [(&elf.dynsyms, &elf.dynstrtab), (&elf.syms, &elf.strtab)]
+                .into_iter()
+                .enumerate()
+        {
+            let first_table = table_idx == 0;
             for sym in syms.iter() {
                 if sym.st_value == 0 {
                     continue;
@@ -120,12 +134,52 @@ impl Libc {
                 {
                     continue;
                 }
+                if let Some(n) = strtab.get_at(sym.st_name) {
+                    // ARM mapping symbols（$a/$t/$d 及 $t.x/$d.x…）：objdump 的
+                    // nearest-symbol 查找跳过（打印 <fn+off> 而非 <$d+off>）；
+                    // 但 $a/$t/$d 本身收进 arm_map_syms 供 disassemble_range 切换
+                    if is_arm
+                        && n.len() >= 2
+                        && n.as_bytes()[0] == b'$'
+                        && matches!(n.as_bytes()[1], b'a' | b't' | b'd')
+                    {
+                        if n.len() <= 2 || n.as_bytes()[2] == b'.' {
+                            arm_map_syms.push((
+                                sym.st_value,
+                                match n.as_bytes()[1] {
+                                    b'a' => 0,
+                                    b't' => 1,
+                                    _ => 2,
+                                },
+                            ));
+                        }
+                        continue;
+                    }
+                }
                 let sv = if is_arm { sym.st_value & !1 } else { sym.st_value };
                 if let Some(name) = strtab.get_at(sym.st_name) {
-                    symbol_names.entry(sv).or_insert_with(|| name.to_string());
+                    // 同地址多符号（uclibc .symtab 的 __aeabi_* 别名等）：objdump
+                    // 取 st_size 大者优先 → 名字字典序；但 dynsym 行整体优先
+                    let better = !dynsym_addrs.contains(&sv)
+                        && symbol_sizes
+                            .get(&sv)
+                            .is_none_or(|&(sz0, ref n0)| {
+                                // 全局/弱保持 dynsym 别名表语义：size 降序，名字升序
+                                (std::cmp::Reverse(sym.st_size), name.to_string())
+                                    < (std::cmp::Reverse(sz0), n0.to_string())
+                            });
+                    if better {
+                        symbol_names.insert(sv, name.to_string());
+                        symbol_sizes.insert(sv, (sym.st_size, name.to_string()));
+                    }
+                    if first_table {
+                        dynsym_addrs.insert(sv);
+                    }
                 }
             }
         }
+        arm_map_syms.sort_unstable();
+        arm_map_syms.dedup();
 
         let bin_sh_offset = find_cstr(&data, b"/bin/sh\0");
 
@@ -449,6 +503,7 @@ impl Libc {
             build_id,
             arm_isa_chunks,
             arm_sym_starts,
+            arm_map_syms,
             mips_func_starts,
             mips_code_sections,
             imports_glibc,

@@ -34,6 +34,7 @@ const COND17: [&str; 17] = [
 ];
 
 /// 单条指令解码产物。
+#[allow(dead_code)] // size/flow 供消费方扩展（当前 search21 仅消费 text）
 pub struct Line {
     pub text: String,
     /// 字节长度（thumb 2/4；A32 4）。
@@ -42,6 +43,7 @@ pub struct Line {
     pub flow: Option<Flow>,
 }
 
+#[allow(dead_code)] // 同上：变体载荷暂未被读
 pub enum Flow {
     /// 条件/无条件分支（b{cond}、cbz/cbnz）。
     Branch(u64),
@@ -51,14 +53,49 @@ pub enum Flow {
     Indirect,
 }
 
-/// 反汇编 [lo, hi)（单 ISA piece）。thumb piece 全 force-thumb；跨 hi 的
-/// thumb 宽指令输出 out-of-bounds 标记后停止（objdump piece 语义）。
+/// 反汇编 [lo, hi)（单 ISA piece）。thumb piece 全 force-thumb（master 传
+/// `-M force-thumb`：忽略 mapping symbols）；A32 piece 无选项 —— objdump 依
+/// .symtab 的 $a/$t/$d 切换（thumb / A32 / `.word` 数据）。跨 hi 的 thumb 宽
+/// 指令输出 out-of-bounds 标记后停止（objdump piece 语义）。
 pub fn disassemble_range(libc: &Libc, lo: u64, hi: u64) -> Vec<Line> {
     if libc.arm_thumb_at(lo) {
-        thumb_walk(libc, lo, hi)
-    } else {
-        a32_walk(libc, lo, hi)
+        return thumb_walk(libc, lo, hi);
     }
+    // A32 piece：按 mapping symbols 切段（$a=0 / $t=1 / $d=2）
+    let mut out = Vec::new();
+    let mut cuts: Vec<u64> = libc
+        .arm_map_syms
+        .iter()
+        .map(|&(a, _)| a)
+        .filter(|&a| a > lo && a < hi)
+        .collect();
+    cuts.push(hi);
+    let mut from = lo;
+    for cut in cuts {
+        // 生效的 mapping symbol = from 处或之前最近的一个；无 → A32（piece 基准）
+        let idx = libc.arm_map_syms.partition_point(|&(a, _)| a <= from);
+        let kind = if idx > 0 { libc.arm_map_syms[idx - 1].1 } else { 0 };
+        match kind {
+            1 => out.extend(thumb_walk(libc, from, cut)),
+            2 => out.extend(word_walk(libc, from, cut)),
+            _ => out.extend(a32_walk(libc, from, cut)),
+        }
+        from = cut;
+    }
+    out
+}
+
+/// `$d` 数据段：objdump print_insn_data —— `.word\t0x%08x`。
+fn word_walk(libc: &Libc, lo: u64, hi: u64) -> Vec<Line> {
+    let mut out = Vec::new();
+    let mut addr = lo;
+    while addr + 4 <= hi {
+        let Some(bytes) = libc.bytes_at_vaddr(addr, 4) else { break };
+        let w = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        out.push(mk(addr, format!(".word\t0x{w:08x}"), 4, None));
+        addr += 4;
+    }
+    out
 }
 
 /// arm-dis.c find_ifthen_state：从 pc 向后扫 ≤4 条指令找 IT（窗口起点可能
@@ -113,7 +150,7 @@ fn thumb_walk(libc: &Libc, lo: u64, hi: u64) -> Vec<Line> {
     // IT 状态机（arm-dis.c ifthen_state/ifthen_next_state 的顺序等价物）；
     // 起点 = piece/窗口边界：符号处等价 0，否则向后扫（块内进入）
     let mut it_state: u32 = find_ifthen_state(libc, lo);
-    let mut it_next: u32 = 0;
+    let mut it_next: u32;
     while addr < hi {
         // objdump 的零字节省略（objdump.c disassemble_bytes：skip_zeroes=8 /
         // skip_zeroes_at_end=3，跳过量向下取整到 4 字节）。跳过点之后 IT 状态
@@ -173,7 +210,9 @@ fn thumb_walk(libc: &Libc, lo: u64, hi: u64) -> Vec<Line> {
             it_next,
             cp_num: 0,
             coproc_cond: 16,
+            a32: false,
             u_reg: 16,
+            u2_reg: 16,
             neon_reject: false,
         };
         let rendered = if wide {
@@ -272,6 +311,8 @@ enum Printer {
     Thumb32,
     Coproc,
     Neon,
+    /// A32 print_insn_arm。
+    Arm,
 }
 
 struct Ctx<'a> {
@@ -292,19 +333,17 @@ struct Ctx<'a> {
     /// coproc 编号与 cond（thumb：IT cond 或 16=COND_UNCOND）。
     cp_num: u32,
     coproc_cond: u16,
+    /// A32（print_insn_arm）入口：coproc literal 注释的 pc+8 vs thumb 的 pc+4。
+    a32: bool,
     /// coproc %ru 的 u_reg 跟踪。
     u_reg: u32,
+    /// A32 %RU 的 U_reg 跟踪（独立于 u_reg）。
+    u2_reg: u32,
     /// neon 打印器的对齐拒绝（C 的 return false）。
     neon_reject: bool,
 }
 
 impl<'a> Ctx<'a> {
-    fn field(&self, hi: u32, lo: u32) -> u32 {
-        if hi < lo || hi > 31 {
-            return 0;
-        }
-        (self.given >> lo) & ((1u32 << (hi - lo + 1)) - 1)
-    }
 
     fn it_cond(&self) -> usize {
         ((self.it_state >> 4) & 0xf) as usize
@@ -515,9 +554,52 @@ fn emit_field(ctx: &mut Ctx, val: u32, width: u32, conv: char, b: &[u8], i: &mut
                 ctx.u_reg = val;
             }
         }
+        (Printer::Arm, 'R') => {
+            out.push_str(REG[(val & 0xf) as usize]);
+            if val == 15 {
+                ctx.unpred = true;
+            }
+            if *i < b.len() && b[*i] == b'u' {
+                *i += 1;
+                if ctx.u_reg == val {
+                    ctx.unpred = true;
+                }
+                ctx.u_reg = val;
+            }
+            if *i < b.len() && b[*i] == b'U' {
+                *i += 1;
+                if ctx.u2_reg == val {
+                    ctx.unpred = true;
+                }
+                ctx.u2_reg = val;
+            }
+        }
         (Printer::Thumb16, 'd') | (Printer::Thumb32, 'd') | (Printer::Neon, 'd') => {
             out.push_str(&val.to_string());
             ctx.vic = val as i64;
+        }
+        (Printer::Arm, 'd') => {
+            out.push_str(&val.to_string());
+            ctx.vic = val as i64;
+        }
+        (Printer::Arm, 'x') => {
+            // objdump printf "0x%08lx"
+            out.push_str(&format!("0x{val:08x}"));
+        }
+        (Printer::Arm, 'b') => {
+            out.push_str(&(val * 8).to_string());
+            ctx.vic = (val * 8) as i64;
+        }
+        (Printer::Arm, 'W') => {
+            out.push_str(&(val + 1).to_string());
+            ctx.vic = val as i64 + 1;
+        }
+        (Printer::Arm, 'X') => {
+            out.push_str(&format!("{:01x}", val & 0xf));
+            ctx.vic = val as i64;
+        }
+        (Printer::Arm, 'T') => {
+            out.push_str(REG[((val + 1) & 0xf) as usize]);
         }
         (Printer::Coproc, 'd') => {
             out.push_str(&val.to_string());
@@ -622,22 +704,21 @@ fn emit_field(ctx: &mut Ctx, val: u32, width: u32, conv: char, b: &[u8], i: &mut
             } else {
                 0
             };
-            let (fracw, unit) = if dec % 1_000_000 == 0 {
-                (6, dec)
+            let (fracw, div) = if dec % 1_000_000 == 0 {
+                (1u32, 1_000_000u64)
             } else if dec % 10_000 == 0 {
-                (3, dec)
+                (3, 10_000)
             } else {
-                (0, dec)
+                (7, 1)
             };
             out.push_str(&val.to_string());
             out.push_str(&format!(
                 "\t@ 0x{fv:08x} {}{}.{:0w$}",
                 if val & 0x80 != 0 { '-' } else { ' ' },
                 dec / 10_000_000,
-                (dec % 10_000_000) / 10u64.pow(fracw),
+                (dec % 10_000_000) / div,
                 w = fracw as usize,
             ));
-            let _ = unit;
         }
         (Printer::Coproc, 'k') => {
             let from = if ctx.given & (1 << 7) != 0 { 32 } else { 16 };
@@ -746,6 +827,10 @@ fn emit_field(ctx: &mut Ctx, val: u32, width: u32, conv: char, b: &[u8], i: &mut
 /// 裸转换码（`%c` 无位域）。i 指向 conv 之后（供 y/z 消费子类型）。
 fn emit_bare(ctx: &mut Ctx, conv: char, b: &[u8], i: &mut usize, out: &mut String) {
     let g = ctx.given;
+    if ctx.printer == Printer::Arm {
+        emit_bare_arm(ctx, conv, out);
+        return;
+    }
     match (ctx.printer, conv) {
         // ---- thumb16 / thumb32 共通（IT 条件） ----
         (_, 'c') if ctx.printer != Printer::Coproc => {
@@ -951,7 +1036,7 @@ fn emit_bare(ctx: &mut Ctx, conv: char, b: &[u8], i: &mut usize, out: &mut Strin
             let j1 = (g >> 13) & 1;
             let j2 = (g >> 11) & 1;
             let mut off: u64 = 0;
-            off |= (((s == 0) as u64) << 20);
+            off |= ((s == 0) as u64) << 20;
             off |= (j2 as u64) << 19;
             off |= (j1 as u64) << 18;
             off |= ((g & 0x003f_0000) as u64) >> 4;
@@ -966,7 +1051,7 @@ fn emit_bare(ctx: &mut Ctx, conv: char, b: &[u8], i: &mut usize, out: &mut Strin
             let i1 = (g >> 13) & 1;
             let i2 = (g >> 11) & 1;
             let mut off: u64 = 0;
-            off |= (((s == 0) as u64) << 24);
+            off |= ((s == 0) as u64) << 24;
             off |= (((!(i1 ^ s)) & 1) as u64) << 23;
             off |= (((!(i2 ^ s)) & 1) as u64) << 22;
             off |= ((g & 0x03ff_0000) as u64) >> 4;
@@ -1503,7 +1588,7 @@ fn emit_bare(ctx: &mut Ctx, conv: char, b: &[u8], i: &mut usize, out: &mut Strin
         }
         (Printer::Coproc, 'l') => {
             let rn = ((g >> 16) & 0xf) as usize;
-            let mut off = (g & 0xff) as i64;
+            let off = (g & 0xff) as i64;
             let mult: i64 = if g & 0x100 != 0 { 4 } else { 1 };
             let n = g & 0x0080_0000 == 0;
             let p = g & 0x0100_0000 != 0;
@@ -1568,6 +1653,426 @@ fn emit_bare(ctx: &mut Ctx, conv: char, b: &[u8], i: &mut usize, out: &mut Strin
     }
 }
 
+/// A32（print_insn_arm）裸转换码。
+fn emit_bare_arm(ctx: &mut Ctx, conv: char, out: &mut String) {
+    let g = ctx.given;
+    // 位宏（arm-dis.c 7828-7833）
+    let pre = g & (1 << 24) != 0;
+    let writeback = g & (1 << 21) != 0;
+    let negative = g & (1 << 23) == 0;
+    match conv {
+        'a' => {
+            let s = print_arm_address(ctx, g);
+            out.push_str(&s);
+        }
+        'P' => {
+            let s = print_arm_address(ctx, g | (1 << 24));
+            out.push_str(&s);
+        }
+        'b' => {
+            // b/bl：disp*4 + pc + 8
+            let disp = (((g & 0xff_ffff) ^ 0x800_000) as i64) - 0x800_000;
+            let t = (ctx.pc as i64 + 8 + disp * 4) as u64;
+            ctx.target(t, out);
+        }
+        'B' => {
+            // V5 BLX(1)：pc+25 位偏移，H 位 +2
+            let mut off: i64 = if !negative { -1 ^ 0x00ff_ffff } else { 0 };
+            off += (g & 0x00ff_ffff) as i64;
+            off <<= 2;
+            let mut t = (off + ctx.pc as i64 + 8) as u64;
+            if g & 0x0100_0000 != 0 {
+                t += 2;
+            }
+            ctx.target(t, out);
+        }
+        'c' => {
+            // cond ≠ al 才打印（arm-dis.c case 'c'）
+            let cond = (g >> 28) & 0xf;
+            if cond != 0xe {
+                out.push_str(COND17[cond as usize]);
+            }
+        }
+        'e' => {
+            let imm = (g & 0xf) | ((g & 0xfff00) >> 4);
+            out.push_str(&imm.to_string());
+            ctx.vic = imm as i64;
+        }
+        'E' => {
+            // BFI/BFC 的 LSB/WIDTH
+            let msb = ((g & 0x001f_0000) >> 16) as i64;
+            let lsb = ((g & 0x0000_f80) >> 7) as i64;
+            let w = msb - lsb + 1;
+            if w > 0 {
+                out.push_str(&format!("#{lsb}, #{w}"));
+            } else {
+                out.push_str(&format!("(invalid: {lsb}:{msb})"));
+            }
+        }
+        'm' => {
+            // 寄存器列表 {..}；空列表 → UNPREDICTABLE
+            let mut started = false;
+            out.push('{');
+            for reg in 0..16usize {
+                if g & (1 << reg) != 0 {
+                    if started {
+                        out.push_str(", ");
+                    }
+                    started = true;
+                    out.push_str(REG[reg]);
+                }
+            }
+            out.push('}');
+            if !started {
+                ctx.unpred = true;
+            }
+        }
+        'o' => {
+            // data-processing 操作数 2：imm rot 或 shifted register
+            if g & 0x0200_0000 != 0 {
+                let rotate = ((g & 0xf00) >> 7) as u32;
+                let immed = g & 0xff;
+                let a = (immed << ((32 - rotate) & 31) | immed >> rotate) & 0xffff_ffff;
+                let mut i = 0u32;
+                while i < 32 {
+                    if (a << i | a >> ((32 - i) & 31)) <= 0xff {
+                        break;
+                    }
+                    i += 2;
+                }
+                if i != rotate {
+                    out.push_str(&format!("#{immed}, {rotate}"));
+                } else {
+                    // printf #%d：unsigned 按补码十进制
+                    out.push_str(&format!("#{}", a as i32));
+                }
+                ctx.vic = a as i64;
+            } else {
+                arm_decode_shift(ctx, true, out);
+            }
+        }
+        'p' => {
+            // tst/cmp/cmn/teq 的 p-变体（V6+ → UNPREDICTABLE）
+            if g & 0x0000_f000 == 0x0000_f000 {
+                ctx.unpred = true;
+            }
+        }
+        'q' => arm_decode_shift(ctx, false, out),
+        's' | 'S' => {
+            // 寻址模式 3（extra load/store）。immediate 位 = I_BIT（bit 22，
+            // 与模式 2 的 bit 25 相反）。allow_unpredictable（%S）不影响文本。
+            let imm = g & (1 << 22) != 0;
+            if g & 0x004f_0000 == 0x004f_0000 {
+                // PC 相对 + immediate
+                let offset = (((g & 0xf00) >> 4) | (g & 0xf)) as i64;
+                out.push('[');
+                out.push_str("pc");
+                if pre {
+                    if offset != 0 || negative {
+                        out.push_str(&format!(
+                            ", #{}{}",
+                            if negative { "-" } else { "" },
+                            offset
+                        ));
+                    }
+                    out.push(']');
+                    if writeback {
+                        out.push('!');
+                    }
+                    let off = if negative { -offset } else { offset };
+                    out.push_str("\t@ ");
+                    let lit = (ctx.pc as i64 + 8 + off) as u64;
+                    out.push_str(&sym(ctx.libc, lit));
+                } else {
+                    out.push_str("], ");
+                    out.push_str(&format!(
+                        "#{}{}",
+                        if negative { "-" } else { "" },
+                        offset
+                    ));
+                    ctx.unpred = true;
+                }
+            } else {
+                let offset = (((g & 0xf00) >> 4) | (g & 0xf)) as i64;
+                out.push('[');
+                out.push_str(REG[((g >> 16) & 0xf) as usize]);
+                if pre {
+                    if imm {
+                        if writeback || negative || offset != 0 {
+                            out.push_str(&format!(
+                                ", #{}{}",
+                                if negative { "-" } else { "" },
+                                offset
+                            ));
+                        }
+                        let off = if negative { -offset } else { offset };
+                        ctx.vic = off;
+                    } else {
+                        out.push_str(&format!(
+                            ", {}",
+                            if negative { "-" } else { "" }
+                        ));
+                        let rm = (g & 0xf) as usize;
+                        out.push_str(REG[rm]);
+                        if writeback && (g & 0xf) == ((g >> 12) & 0xf) {
+                            ctx.unpred = true;
+                        }
+                    }
+                    out.push(']');
+                    if writeback {
+                        out.push('!');
+                    }
+                } else {
+                    if imm {
+                        out.push_str("], ");
+                        out.push_str(&format!(
+                            "#{}{}",
+                            if negative { "-" } else { "" },
+                            offset
+                        ));
+                        let off = if negative { -offset } else { offset };
+                        ctx.vic = off;
+                    } else {
+                        out.push_str("], ");
+                        out.push_str(&format!(
+                            "{}",
+                            if negative { "-" } else { "" }
+                        ));
+                        let rm = (g & 0xf) as usize;
+                        out.push_str(REG[rm]);
+                        if (g & 0xf) == ((g >> 12) & 0xf) {
+                            ctx.unpred = true;
+                        }
+                    }
+                    if writeback || (!imm && (g & 0xf) == 0xf) {
+                        ctx.unpred = true;
+                    }
+                }
+            }
+        }
+        't' => {
+            if g & 0x0120_0000 == 0x0020_0000 {
+                out.push('t');
+            }
+        }
+        'C' => {
+            // PSR 字段 / banked register
+            if g & 0x0200_0200 == 0x200 {
+                let sysm = ((g & 0x004f_0000) >> 16) | ((g & 0x300) >> 4);
+                match banked_regname(sysm) {
+                    Some(n) => out.push_str(n),
+                    None => out.push_str(&format!("(UNDEF: {sysm})")),
+                }
+            } else {
+                out.push_str(if g & 0x0040_0000 != 0 { "SPSR_" } else { "CPSR_" });
+                if g & 0x80000 != 0 {
+                    out.push('f');
+                }
+                if g & 0x40000 != 0 {
+                    out.push('s');
+                }
+                if g & 0x20000 != 0 {
+                    out.push('x');
+                }
+                if g & 0x10000 != 0 {
+                    out.push('c');
+                }
+            }
+        }
+        'R' => {
+            let sysm = ((g & 0x004f_0000) >> 16) | ((g & 0x300) >> 4);
+            match banked_regname(sysm) {
+                Some(n) => out.push_str(n),
+                None => out.push_str(&format!("(UNDEF: {sysm})")),
+            }
+        }
+        'U' => {
+            // barrier 选项
+            if g & 0xf0 == 0x60 {
+                if g & 0xf == 0xf {
+                    out.push_str("sy");
+                } else {
+                    out.push_str(&format!("#{}", g & 0xf));
+                }
+            } else if let Some(o) = data_barrier_option(g & 0xf) {
+                out.push_str(o);
+            } else {
+                out.push_str(&format!("#{}", g & 0xf));
+            }
+        }
+        'V' => {
+            // MOVW/MOVT 16 位 imm
+            let hi = ((g & 0x000f_0000) >> 4) as i64;
+            let lo = (g & 0x0000_0fff) as i64;
+            out.push_str(&format!("#{}", hi | lo));
+            ctx.vic = hi | lo;
+        }
+        _ => out.push('?'),
+    }
+}
+
+/// arm_decode_shift（print_shift：操作数 2 的 shifted register 形式）。
+fn arm_decode_shift(ctx: &Ctx, print_shift: bool, out: &mut String) {
+    let g = ctx.given;
+    const SHIFT: [&str; 4] = ["lsl", "lsr", "asr", "ror"];
+    out.push_str(REG[(g & 0xf) as usize]);
+    if g & 0xff0 == 0 {
+        return;
+    }
+    if g & 0x10 == 0 {
+        let amount = ((g & 0xf80) >> 7) as u32;
+        let shift = ((g & 0x60) >> 5) as usize;
+        let amount = if amount == 0 {
+            if shift == 3 {
+                out.push_str(", rrx");
+                return;
+            }
+            32
+        } else {
+            amount
+        };
+        if print_shift {
+            out.push_str(&format!(", {} #{amount}", SHIFT[shift]));
+        } else {
+            out.push_str(&format!(", #{amount}"));
+        }
+    } else if g & 0x80 == 0x80 {
+        out.push_str("\t@ <illegal shifter operand>");
+    } else if print_shift {
+        out.push_str(&format!(", {} ", SHIFT[((g & 0x60) >> 5) as usize]));
+        out.push_str(REG[((g & 0xf00) >> 8) as usize]);
+    } else {
+        out.push_str(&format!(", {}", REG[((g & 0xf00) >> 8) as usize]));
+    }
+}
+
+/// print_arm_address（寻址模式 2 主路径）。返回渲染文本；vic 已写入 ctx。
+fn print_arm_address(ctx: &mut Ctx, given: u32) -> String {
+    let mut out = String::new();
+    let pre = given & (1 << 24) != 0;
+    let writeback = given & (1 << 21) != 0;
+    let negative = given & (1 << 23) == 0;
+    if given & 0x000f_0000 == 0x000f_0000 && given & 0x0200_0000 == 0 {
+        // PC 相对 literal pool
+        let mut off = (given & 0xfff) as i64;
+        out.push('[');
+        out.push_str("pc");
+        if pre {
+            if writeback || negative || off != 0 {
+                out.push_str(&format!(
+                    ", #{}{}",
+                    if negative { "-" } else { "" },
+                    off
+                ));
+            }
+            if negative {
+                off = -off;
+            }
+            let lit = (ctx.pc as i64 + 8 + off) as u64;
+            out.push(']');
+            if writeback {
+                out.push('!');
+            }
+            out.push_str("\t@ ");
+            out.push_str(&sym(ctx.libc, lit));
+        } else {
+            out.push_str("], ");
+            out.push_str(&format!(
+                "#{}{}",
+                if negative { "-" } else { "" },
+                off
+            ));
+            let lit = ctx.pc + 8;
+            out.push_str("\t@ ");
+            out.push_str(&sym(ctx.libc, lit));
+        }
+        ctx.vic = 0;
+        return out;
+    }
+    out.push('[');
+    out.push_str(REG[((given >> 16) & 0xf) as usize]);
+    // 寄存器偏移路径 value_in_comment 保持 0（C：offset 只在 imm 路径赋值）
+    let mut offset: i64 = 0;
+    if pre {
+        if given & 0x0200_0000 == 0 {
+            let off = (given & 0xfff) as i64;
+            if writeback || negative || off != 0 {
+                out.push_str(&format!(
+                    ", #{}{}",
+                    if negative { "-" } else { "" },
+                    off
+                ));
+            }
+            offset = off;
+        } else {
+            out.push_str(&format!(", {}", if negative { "-" } else { "" }));
+            arm_decode_shift(ctx, true, &mut out);
+        }
+        out.push(']');
+        if writeback {
+            out.push('!');
+        }
+    } else if given & 0x0200_0000 == 0 {
+        let off = (given & 0xfff) as i64;
+        out.push_str("], ");
+        out.push_str(&format!(
+            "#{}{}",
+            if negative { "-" } else { "" },
+            off
+        ));
+        offset = off;
+    } else {
+        out.push_str("], ");
+        out.push_str(&format!("{}", if negative { "-" } else { "" }));
+        arm_decode_shift(ctx, true, &mut out);
+    }
+    if negative {
+        offset = -offset;
+    }
+    ctx.vic = offset;
+    out
+}
+
+/// banked_regname（arm-dis.c）：sysm → 寄存器名。
+fn banked_regname(sysm: u32) -> Option<&'static str> {
+    Some(match sysm {
+        0x0 => "r8_usr",
+        0x1 => "r9_usr",
+        0x2 => "r10_usr",
+        0x3 => "r11_usr",
+        0x4 => "r12_usr",
+        0x5 => "sp_usr",
+        0x6 => "lr_usr",
+        0x8 => "r8_fiq",
+        0x9 => "r9_fiq",
+        0xa => "r10_fiq",
+        0xb => "r11_fiq",
+        0xc => "r12_fiq",
+        0xd => "sp_fiq",
+        0xe => "lr_fiq",
+        0x10 => "lr_irq",
+        0x11 => "sp_irq",
+        0x12 => "lr_svc",
+        0x13 => "sp_svc",
+        0x14 => "lr_abt",
+        0x15 => "sp_abt",
+        0x16 => "lr_und",
+        0x17 => "sp_und",
+        0x18 => "lr_mon",
+        0x19 => "sp_mon",
+        0x1a => "elr_hyp",
+        0x1b => "sp_hyp",
+        0x1c => "spsr_fiq",
+        0x1d => "spsr_irq",
+        0x1e => "spsr_svc",
+        0x1f => "spsr_abt",
+        0x20 => "spsr_und",
+        0x21 => "spsr_mon",
+        0x22 => "spsr_hyp",
+        _ => return None,
+    })
+}
+
 /// thumb32 `%a`：普通 load/store 寻址模式。
 fn thumb32_addr(ctx: &mut Ctx) -> String {
     let g = ctx.given;
@@ -1579,6 +2084,7 @@ fn thumb32_addr(ctx: &mut Ctx) -> String {
     let i8 = g & 0xff;
     let mut writeback = false;
     let mut postind = false;
+    #[allow(unused_assignments)] // arm-dis.c 同构：各寻址模式覆盖 offset
     let mut offset: i64 = 0;
     out.push('[');
     out.push_str(REG[rn]);
@@ -1690,8 +2196,9 @@ fn coproc_addr(ctx: &mut Ctx, k: bool) -> String {
     }
     if rn == 15 && (p || w) {
         out.push_str("\t@ ");
-        // thumb 32 位指令：offset + pc + 4 - (pc & 3)（bytes_per_chunk=2）
-        let lit = (offset + ctx.pc as i64 + 4 - (ctx.pc & 3) as i64) as u64;
+        // offset + pc + bytes_per_chunk*2 - (pc & 3)：thumb32=2（pc+4）、A32=4（pc+8）
+        let bpc = if ctx.a32 { 4 } else { 2 };
+        let lit = (offset + ctx.pc as i64 + bpc * 2 - (ctx.pc & 3) as i64) as u64;
         let s = sym(ctx.libc, lit);
         out.push_str(&s);
     }
@@ -1798,7 +2305,8 @@ fn is_call_mnemonic(text: &str) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// A32 兜底（dp imm / b / bl / bx / ldr / str / push / pop）—— GT 无 A32 行
+// A32：print_insn_arm（arm-dis.c）—— coproc → neon → generic coproc →
+// arm_opcodes 表。GT 无 A32 行（glibc 全 thumb），uclibc arm 全 A32 走此路径。
 // ---------------------------------------------------------------------------
 
 fn a32_walk(libc: &Libc, lo: u64, hi: u64) -> Vec<Line> {
@@ -1810,154 +2318,175 @@ fn a32_walk(libc: &Libc, lo: u64, hi: u64) -> Vec<Line> {
             continue;
         }
         let Some(bytes) = libc.bytes_at_vaddr(addr, 4) else { break };
-        let word = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
-        match a32(libc, addr, word) {
-            Some((t, flow)) => out.push(mk(addr, t, 4, flow)),
-            None => out.push(mk(
-                addr,
-                format!("\t\t@ <UNDEFINED> instruction: 0x{word:08x}"),
-                4,
-                None,
-            )),
-        }
+        let given = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        let mut ctx = Ctx {
+            libc,
+            pc: addr,
+            given,
+            printer: Printer::Arm,
+            vic: 0,
+            branch_target: None,
+            indirect: false,
+            unpred: false,
+            it_state: 0,
+            it_next: 0,
+            cp_num: (given >> 8) & 0xf,
+            coproc_cond: 16,
+            a32: true,
+            u_reg: 16,
+            u2_reg: 16,
+            neon_reject: false,
+        };
+        let rendered = arm_match(&mut ctx);
+        let text = match rendered {
+            Some(mut t) => {
+                if ctx.vic > 32 || ctx.vic < -16 {
+                    // A32 value_in_comment 显式 & 0xffffffff（LP64 打印）
+                    t.push_str(&format!("\t@ 0x{:x}", ctx.vic as u32 as u64));
+                }
+                if ctx.unpred {
+                    t.push_str("\t@ <UNPREDICTABLE>");
+                }
+                t
+            }
+            None => format!("\t\t@ <UNDEFINED> instruction: 0x{given:08x}"),
+        };
+        let flow = extract_flow(&ctx, &text);
+        out.push(mk(addr, text, 4, flow));
         addr += 4;
     }
     out
 }
 
-fn a32(libc: &Libc, addr: u64, word: u32) -> Option<(String, Option<Flow>)> {
-    let cond = (word >> 28) as usize;
-    let mut branch_target = None;
-    let mut is_call = false;
-    let mut indirect = false;
-    let text = if word & 0x0e00_0000 == 0x0a00_0000 {
-        let off = sext(word & 0xff_ffff, 24) << 2;
-        let target = (addr as i64 + 8 + off) as u64;
-        branch_target = Some(target);
-        is_call = word & 0x0100_0000 != 0;
-        let name = if is_call { "bl" } else { "b" };
-        format!("{name}{}\t{}", COND17[cond], sym(libc, target))
-    } else if word & 0x0ff0_fff0 == 0x0120_0010 {
-        indirect = true;
-        format!("bx{}\t{}", COND17[cond], REG[(word & 0xf) as usize])
-    } else if word & 0x0de0_0000 == 0x0400_0000 && word & 0x10 == 0 {
-        ldr_str_a32(libc, addr, word, cond)
-    } else if word & 0x0de0_0000 == 0x0200_0000 && word & 0x10 == 0 {
-        dp_imm_a32(word, cond)
-    } else if (word & 0x0fff_0000) == 0xe92d_0000 & 0x0fff_0000 {
-        format!("push{}\t{{{}}}", COND17[cond], reglist32(word & 0xffff))
-    } else if (word & 0x0fff_0000) == (0xe8bd_0000 & 0x0fff_0000) {
-        indirect = word & 0x8000 != 0;
-        format!("pop{}\t{{{}}}", COND17[cond], reglist32(word & 0xffff))
-    } else {
-        return None;
-    };
-    let flow = if let Some(t) = branch_target {
-        Some(if is_call { Flow::Call(t) } else { Flow::Branch(t) })
-    } else if indirect {
-        Some(Flow::Indirect)
-    } else {
-        None
-    };
-    Some((text, flow))
+/// print_insn_arm 的表匹配序：coprocessor → neon → generic coprocessor →
+/// arm_opcodes（含 catchall UNDEFINED）。None = 未知指令（UNKNOWN32 输出）。
+fn arm_match(ctx: &mut Ctx) -> Option<String> {
+    if let Some(t) = coproc_match_a32(ctx) {
+        return Some(t);
+    }
+    if let Some(t) = neon_match_a32(ctx) {
+        return Some(t);
+    }
+    if let Some(t) = generic_coproc_match_a32(ctx) {
+        return Some(t);
+    }
+    // 无条件空间限制：cond=0xf 的指令只匹配 cond 位全在 mask 中的条目，
+    // 或 catchall（mask==0 && value==0）
+    for &(val, mask, fmt) in tables::ARM32 {
+        if ctx.given & mask != val {
+            continue;
+        }
+        if ctx.given & 0xf000_0000 == 0xf000_0000
+            && mask & 0xf000_0000 != 0xf000_0000
+            && !(mask == 0 && val == 0)
+        {
+            continue;
+        }
+        let Some(fmt) = fmt else { return None };
+        return Some(interp(ctx, fmt));
+    }
+    None
 }
 
-fn ldr_str_a32(libc: &Libc, addr: u64, word: u32, cond: usize) -> String {
-    let rd = ((word >> 12) & 0xf) as usize;
-    let rn = ((word >> 16) & 0xf) as usize;
-    let l = word & 0x0010_0000 != 0;
-    let name = if l { "ldr" } else { "str" };
-    let imm12 = word & 0xfff;
-    let u = word & 0x0080_0000 != 0;
-    let off: i64 = if u { imm12 as i64 } else { -(imm12 as i64) };
-    if rn == 15 && word & 0x0200_0000 == 0 {
-        let lit = (addr as i64 + 8 + off) as u64;
-        return format!(
-            "{name}{}\t{}, [pc, #{off}]\t@ ({})",
-            COND17[cond],
-            REG[rd],
-            sym(libc, lit)
-        );
-    }
-    if word & 0x0200_0000 == 0 {
-        let sign = if u { "" } else { "-" };
-        let addr_txt = if imm12 == 0 {
-            format!("[{}]", REG[rn])
-        } else {
-            format!("[{}, #{sign}{imm12}]", REG[rn])
-        };
-        let comment = imm_comment(off);
-        format!("{name}{}\t{}, {addr_txt}{comment}", COND17[cond], REG[rd])
-    } else {
-        let rm = (word & 0xf) as usize;
-        format!("{name}{}\t{}, [{}, {}]", COND17[cond], REG[rd], REG[rn], REG[rm])
-    }
-}
-
-fn dp_imm_a32(word: u32, cond: usize) -> String {
-    let op = (word >> 21) & 0xf;
-    let rn = ((word >> 16) & 0xf) as usize;
-    let rd = ((word >> 12) & 0xf) as usize;
-    let imm = arm_expand_imm(word & 0xfff) as i64;
-    let name = match (op, word & 0x0010_0000 != 0) {
-        (0, false) => "and",
-        (0, true) => "ands",
-        (1, false) => "eor",
-        (1, true) => "eors",
-        (2, false) => "sub",
-        (2, true) => "subs",
-        (3, false) => "rsb",
-        (3, true) => "rsbs",
-        (4, false) => "add",
-        (4, true) => "adds",
-        (10, false) => "cmp",
-        (11, false) => "cmn",
-        (12, false) => "orr",
-        (12, true) => "orrs",
-        (13, false) => "mov",
-        (13, true) => "movs",
-        (14, false) => "bic",
-        (14, true) => "bics",
-        (15, false) => "mvn",
-        (15, true) => "mvns",
-        _ => return String::new(),
-    };
-    if matches!(op, 8..=11) {
-        return format!("{name}{}\t{}, #{imm}{}", COND17[cond], REG[rn], imm_comment(imm));
-    }
-    if op == 13 || op == 15 {
-        format!("{name}{}\t{}, #{imm}{}", COND17[cond], REG[rd], imm_comment(imm))
-    } else {
-        format!(
-            "{name}{}\t{}, {}, #{imm}{}",
-            COND17[cond],
-            REG[rd],
-            REG[rn],
-            imm_comment(imm)
-        )
-    }
-}
-
-fn reglist32(mask: u32) -> String {
-    let mut regs = Vec::new();
-    for i in 0..16usize {
-        if mask & (1 << i) != 0 {
-            regs.push(REG[i]);
+/// print_insn_coprocessor_1（thumb=false）：仅无条件指令对无条件模式；
+/// 条件指令按 cond 匹配（cond=0xe → COND_UNCOND）。
+fn coproc_match_a32(ctx: &mut Ctx) -> Option<String> {
+    for tab in [tables::COPROC] {
+        for &(val, mask, fmt) in tab {
+            let (mut m, v) = (mask, val);
+            if ctx.given & 0xf000_0000 == 0xf000_0000 {
+                m |= 0xf000_0000;
+                ctx.coproc_cond = 16;
+            } else {
+                let cond = (ctx.given >> 28) & 0xf;
+                ctx.coproc_cond = if cond == 0xe { 16 } else { cond as u16 };
+            }
+            if ctx.given & m != v {
+                continue;
+            }
+            match val {
+                0x0e000000 | 0xfe000000 | 0x0e000010 | 0x0e100010 | 0x0c100000 | 0x0c000000
+                    if matches!(ctx.cp_num, 9 | 10 | 11) =>
+                {
+                    continue;
+                }
+                0xfe000010 | 0xfe100010 | 0xfc100000 | 0xfc000000 if matches!(ctx.cp_num, 9 | 10 | 11) => {
+                    ctx.unpred = true;
+                }
+                _ => {}
+            }
+            let Some(fmt) = fmt else { return None };
+            ctx.printer = Printer::Coproc;
+            return Some(interp(ctx, fmt));
         }
     }
-    regs.join(", ")
+    None
 }
 
-fn arm_expand_imm(imm12: u32) -> u32 {
-    (imm12 & 0xff).rotate_right(((imm12 >> 8) & 0xf) * 2)
-}
-
-fn imm_comment(v: i64) -> String {
-    if v > 32 || v < -16 {
-        format!("\t@ 0x{:x}", v as u64)
-    } else {
-        String::new()
+/// print_insn_neon（thumb=false）：无编码翻译；无条件空间限制同上。
+fn neon_match_a32(ctx: &mut Ctx) -> Option<String> {
+    ctx.printer = Printer::Neon;
+    let mut result: Option<String> = None;
+    for &(val, mask, fmt) in tables::NEON {
+        let (mut m, v) = (mask, val);
+        let cond: u16;
+        if ctx.given & 0xf000_0000 == 0xf000_0000 {
+            m |= 0xf000_0000;
+            cond = 16;
+        } else {
+            let c = (ctx.given >> 28) & 0xf;
+            cond = if c == 0xe { 16 } else { c as u16 };
+        }
+        ctx.coproc_cond = cond;
+        if ctx.given & m != v {
+            continue;
+        }
+        let Some(fmt) = fmt else { continue };
+        ctx.neon_reject = false;
+        let t = interp(ctx, fmt);
+        if !ctx.neon_reject {
+            result = Some(t);
+            break;
+        }
     }
+    if result.is_none() {
+        ctx.printer = Printer::Arm;
+    }
+    result
+}
+
+fn generic_coproc_match_a32(ctx: &mut Ctx) -> Option<String> {
+    // generic 表已在 coproc_match_a32 内一起遍历（coprocessor_opcodes +
+    // generic_coprocessor_opcodes 两个表按 print_insn_arm 的调用序拆开：先
+    // COPROC 再 NEON 再 COPROC_GENERIC）。此处仅遍历 generic 表。
+    for &(val, mask, fmt) in tables::COPROC_GENERIC {
+        let (mut m, v) = (mask, val);
+        if ctx.given & 0xf000_0000 == 0xf000_0000 {
+            m |= 0xf000_0000;
+            ctx.coproc_cond = 16;
+        } else {
+            let cond = (ctx.given >> 28) & 0xf;
+            ctx.coproc_cond = if cond == 0xe { 16 } else { cond as u16 };
+        }
+        if ctx.given & m != v {
+            continue;
+        }
+        match val {
+            0x0e000000 | 0xfe000000 | 0x0e000010 | 0x0e100010 | 0x0c100000 | 0x0c000000
+                if matches!(ctx.cp_num, 9 | 10 | 11) =>
+            {
+                continue;
+            }
+            0xfe000010 | 0xfe100010 | 0xfc100000 | 0xfc000000 if matches!(ctx.cp_num, 9 | 10 | 11) => {
+                ctx.unpred = true;
+            }
+            _ => {}
+        }
+        let Some(fmt) = fmt else { return None };
+        ctx.printer = Printer::Coproc;
+        return Some(interp(ctx, fmt));
+    }
+    None
 }
 
 /// printf `%.<prec>g` 的 Rust 等价（NEON 浮点常量注释）。
@@ -1985,10 +2514,3 @@ fn fmt_g(val: f64, prec: usize) -> String {
     }
 }
 
-fn sext(v: u32, bits: u32) -> i64 {
-    if bits == 0 || bits > 32 {
-        return v as i64;
-    }
-    let shift = 32 - bits;
-    (((v << shift) as i32) >> shift) as i64
-}
