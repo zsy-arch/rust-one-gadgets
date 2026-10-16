@@ -71,36 +71,10 @@ struct Cli {
     #[arg(long, default_value_t = 0)]
     base: u64,
 
-    /// 开发用：arm textgen 与 master objdump 行流比对（FILE 为窗口 GT 文件目录）
-    #[arg(long = "arm-gt-check", hide = true)]
-    arm_gt_check: bool,
-
-    /// 开发用：riscv64 textgen 与 GT 行流比对
-    #[arg(long = "rv64-gt-check", hide = true)]
-    rv64_gt_check: bool,
-
-    /// 开发用：mips textgen 与 GT 全量行流比对
-    #[arg(long = "mips-gt-check", hide = true)]
-    mips_gt_check: bool,
 }
 
 fn main() {
     let cli = Cli::parse();
-
-    if cli.arm_gt_check {
-        arm_gt_check(&cli.file.clone().unwrap_or_default());
-        return;
-    }
-
-    if cli.rv64_gt_check {
-        rv64_gt_check(&cli.file.clone().unwrap_or_default());
-        return;
-    }
-
-    if cli.mips_gt_check {
-        mips_gt_check(&cli.file.clone().unwrap_or_default());
-        return;
-    }
 
     // --info BuildID：打印数据库注释后退出
     if let Some(id) = &cli.info {
@@ -127,25 +101,38 @@ fn main() {
     }
 
     // 取 gadgets（build-id 数据库 / 文件扫描两条路径）。
-    // trim（去重/子集剔除）只属于扫描路径——Ruby 里 DB gadgets 直接进 refine（1.10.0：
-    // trim 在 Fetcher#from_file 内部，builds() 不经过
+    // trim（去重/子集剔除）只属于扫描路径——Ruby 里 DB gadgets 直接进 refine。
+    // 双代：x86 条目=1.10.0 快照（gadget::refine）；非 x86 条目=master 2.1.1
+    // builds（gadget21::for_level + refine——DB 存全量，trim/all 按 level）。
     let mut gadgets = if let Some(id) = &cli.build_id {
-        let g = match builds::gadgets_by_prefix(id) {
-            Ok(g) => g,
+        let (g, is21) = match builds::gadgets_by_prefix(id) {
+            Ok(v) => v,
             Err(e) => {
                 eprintln!("[OneGadget] {e}");
                 std::process::exit(1);
             }
         };
-        gadget::refine_gadgets(g, cli.level)
+        if is21 {
+            gadget21::refine_gadgets(gadget21::for_level(g, cli.level), cli.level)
+        } else {
+            gadget::refine_gadgets(g, cli.level)
+        }
     } else {
         let file = cli.file.as_ref().unwrap();
         let g = if !cli.force_file {
-            // 先试 build-id 数据库（除非 -f）；非 x86 架构无数据库条目，直接走扫描
-            if let Some(g) = gadgets_from_file_via_build_id(file) {
-                gadget::refine_gadgets(g, cli.level)
+            // 先试 build-id 数据库（除非 -f）；未命中回落全量扫描。
+            // 非 x86 条目：master 2.1.1 语义（for_level + refine）。
+            // 另 master 对 level >= RAW_LEVEL(2) 强制扫描（DB 只存 trim 后全集，
+            // l2 要 every gadget——"this emulates the file, bypassing the db"）。
+            let via_db = if cli.level >= 2 {
+                None
             } else {
-                gadgets_from_file_scan(file, cli.level)
+                gadgets_from_file_via_build_id(file)
+            };
+            match via_db {
+                Some((g, true)) => gadget21::refine_gadgets(gadget21::for_level(g, cli.level), cli.level),
+                Some((g, false)) => gadget::refine_gadgets(g, cli.level),
+                None => gadgets_from_file_scan(file, cli.level),
             }
         } else {
             gadgets_from_file_scan(file, cli.level)
@@ -203,12 +190,13 @@ fn main() {
 }
 
 /// 数据库路径：读文件 build-id → 查内置库。None = 未命中（回落扫描）。
-fn gadgets_from_file_via_build_id(file: &str) -> Option<Vec<gadget::Gadget>> {
+/// 返回 (gadgets, 是否 2.1.1 语义条目)。
+fn gadgets_from_file_via_build_id(file: &str) -> Option<(Vec<gadget::Gadget>, bool)> {
     let data = std::fs::read(file).ok()?;
     let libc = elf::Libc::parse(data).ok()?;
     let bid = libc.build_id?;
-    let g = builds::gadgets_by_build_id(&bid);
-    if g.is_empty() { None } else { Some(g) }
+    let (g, is21) = builds::gadgets_by_build_id(&bid);
+    if g.is_empty() { None } else { Some((g, is21)) }
 }
 
 /// 全量扫描路径（含 level 过滤：x86 → 1.10.0 语义，其余 → 2.1.1 语义）。
@@ -299,188 +287,4 @@ fn display_gadgets(gadgets: &[gadget::Gadget], cli: &Cli) {
             }
         }
     }
-}
-
-/// 开发工具：arm textgen 输出与 /tmp/arm_gt 的 master objdump 行流逐行比对。
-/// 用法：rog --arm-gt-check <libc文件>；GT 文件名 = <libc文件名>.txt。
-#[allow(dead_code)]
-fn arm_gt_check(file: &str) {
-    use crate::textgen::arm::disassemble_range;
-    let data = std::fs::read(file).unwrap();
-    let libc = crate::elf::Libc::parse(data).unwrap();
-    let gt_file = format!(
-        "/tmp/arm_gt/{}.txt",
-        std::path::Path::new(file)
-            .file_stem()
-            .unwrap()
-            .to_str()
-            .unwrap()
-    );
-    let gt: Vec<(bool, String)> = std::fs::read_to_string(&gt_file)
-        .unwrap()
-        .lines()
-        .filter(|l| !l.is_empty())
-        .map(|l| match l.strip_prefix('W') {
-            Some(r) => (true, r.to_string()),
-            None => (false, l.trim_start().to_string()),
-        })
-        .collect();
-    let mut windows: Vec<Vec<String>> = vec![];
-    for (is_start, line) in gt {
-        if is_start {
-            windows.push(vec![]);
-        }
-        windows.last_mut().unwrap().push(line);
-    }
-    let mut bad = 0usize;
-    let mut shown = 0usize;
-    let mut total = 0usize;
-    for w in &windows {
-        let first_addr = u64::from_str_radix(w[0].split(':').next().unwrap(), 16).unwrap();
-        let last_addr =
-            u64::from_str_radix(w.last().unwrap().split(':').next().unwrap(), 16).unwrap();
-        let mut bounds: Vec<u64> = vec![first_addr];
-        for &(a, _) in &libc.arm_isa_chunks {
-            if a > first_addr && a <= last_addr {
-                bounds.push(a);
-            }
-        }
-        bounds.sort_unstable();
-        bounds.dedup();
-        let mut got: Vec<String> = Vec::new();
-        for pair in bounds.windows(2) {
-            got.extend(disassemble_range(&libc, pair[0], pair[1]).into_iter().map(|l| l.text));
-        }
-        // 末段 hi：GT 末行是 OOB 标记 → 原窗口 stop 切在标记地址 +2（宽指令跨界）；
-        // 否则 stop ≥ 最后一条完整指令尾 → +4
-        let tail = if w.last().map(|l| l.contains("is out of bounds")).unwrap_or(false) {
-            2
-        } else {
-            4
-        };
-        got.extend(
-            disassemble_range(&libc, *bounds.last().unwrap(), last_addr + tail)
-                .into_iter()
-                .map(|l| l.text),
-        );
-        total += w.len();
-        // 尾部可能多解码 1-2 行（last+4 过冲）；按 min(len) 比对
-        for (g, want) in got.iter().zip(w.iter()) {
-            if g != want {
-                bad += 1;
-                if shown < 10000 {
-                    println!("WANT: {want}\n GOT: {g}\n");
-                    shown += 1;
-                }
-            }
-        }
-        if got.len() != w.len() {
-            println!("LEN: got {} want {}", got.len(), w.len());
-        }
-    }
-    println!("TOTAL {bad}/{total} ({:.3}% bad)", bad as f64 * 100.0 / total as f64);
-}
-
-/// 开发工具：riscv64 textgen 输出与 /tmp/rv64_gt 的 objdump 行流逐行比对。
-#[allow(dead_code)]
-fn rv64_gt_check(file: &str) {
-    let data = std::fs::read(file).unwrap();
-    let libc = crate::elf::Libc::parse(data).unwrap();
-    let gt_file = format!(
-        "/tmp/rv64_gt/{}.txt",
-        std::path::Path::new(file).file_name().unwrap().to_str().unwrap()
-    );
-    let gt: Vec<(bool, String)> = std::fs::read_to_string(&gt_file)
-        .unwrap()
-        .lines()
-        .filter(|l| !l.is_empty())
-        .map(|l| match l.strip_prefix('W') {
-            Some(r) => (true, r.trim_start().to_string()),
-            None => (false, l.trim_start().to_string()),
-        })
-        .collect();
-    let mut windows: Vec<Vec<String>> = vec![];
-    for (is_start, line) in gt {
-        if is_start {
-            windows.push(vec![]);
-        }
-        windows.last_mut().unwrap().push(line);
-    }
-    let mut bad = 0usize;
-    let mut shown = 0usize;
-    let mut total = 0usize;
-    for w in &windows {
-        let first_addr = u64::from_str_radix(w[0].split(':').next().unwrap(), 16).unwrap();
-        let last_addr = u64::from_str_radix(w.last().unwrap().split(':').next().unwrap(), 16).unwrap();
-        let last = w.last().unwrap();
-        let last_body = last.split_once('\t').map(|(_, r)| r).unwrap_or("");
-        let tail = if last_body.starts_with(".short") || last_body.starts_with(".insn 2") {
-            2
-        } else {
-            4
-        };
-        let got = crate::textgen::riscv64::disassemble_range(&libc, first_addr, last_addr + tail);
-        total += w.len();
-        for (g, want) in got.iter().zip(w.iter()) {
-            let want_clean = want.split('#').next().unwrap_or(want).trim_end();
-            let g_clean = g.split('#').next().unwrap_or(g).trim_end();
-            if g_clean != want_clean {
-                bad += 1;
-                if shown < 10000 {
-                    println!("WANT: {want}\n GOT: {g}\n");
-                    shown += 1;
-                }
-            }
-        }
-        if got.len() != w.len() {
-            println!("LEN: got {} want {}", got.len(), w.len());
-        }
-    }
-    println!("TOTAL {bad}/{total} ({:.3}% bad)", bad as f64 * 100.0 / total as f64);
-}
-
-/// 开发工具：mips textgen 与 /tmp/mips_full_<name>.txt 的 objdump 全量行流比对。
-#[allow(dead_code)]
-fn mips_gt_check(file: &str) {
-    let data = std::fs::read(file).unwrap();
-    let libc = crate::elf::Libc::parse(data).unwrap();
-    let gt_file = format!(
-        "/tmp/mips_full_{}.txt",
-        std::path::Path::new(file).file_name().unwrap().to_str().unwrap()
-    );
-    let gt: Vec<String> = std::fs::read_to_string(&gt_file)
-        .unwrap()
-        .lines()
-        .filter(|l| !l.is_empty())
-        .map(|l| l.trim_start().to_string())
-        .collect();
-    // objdump -d 逐 AX section 反汇编（.text/.MIPS.stubs/__libc_freeres_fn/…）
-    let mut got: Vec<String> = Vec::new();
-    for &(saddr, ssize) in &libc.mips_code_sections {
-        got.extend(crate::textgen::mips::disassemble_range(
-            &libc,
-            saddr,
-            saddr + ssize,
-        ));
-    }
-    let mut bad = 0usize;
-    let mut shown = 0usize;
-    for (g, want) in got.iter().zip(gt.iter()) {
-        let want_clean = want.split('#').next().unwrap_or(want).trim_end();
-        let g_clean = g.split('#').next().unwrap_or(g).trim_end();
-        if g_clean != want_clean {
-            bad += 1;
-            if shown < 4000 {
-                println!("WANT: {want_clean}\n GOT: {g_clean}\n");
-                shown += 1;
-            }
-        }
-    }
-    println!(
-        "TOTAL {bad}/{} ({:.3}% bad) len got={} want={}",
-        gt.len(),
-        bad as f64 * 100.0 / gt.len().max(1) as f64,
-        got.len(),
-        gt.len()
-    );
 }
