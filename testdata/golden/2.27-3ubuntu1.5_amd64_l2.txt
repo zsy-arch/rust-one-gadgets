@@ -1,0 +1,50 @@
+0x4f297 execve("/bin/sh", rsp+0x40, environ)
+constraints:
+  address rsp+0x50 is writable
+  rsp & 0xf == 0
+  {"sh", "-c", r12, NULL} is a valid argv
+
+0x4f29e execve("/bin/sh", rsp+0x40, environ)
+constraints:
+  address rsp+0x50 is writable
+  rsp & 0xf == 0
+  rcx == NULL || {rcx, "-c", r12, NULL} is a valid argv
+
+0x4f2a5 execve("/bin/sh", rsp+0x40, environ)
+constraints:
+  address rsp+0x50 is writable
+  rsp & 0xf == 0
+  rcx == NULL || {rcx, rax, r12, NULL} is a valid argv
+
+0x4f302 execve("/bin/sh", rsp+0x40, environ)
+constraints:
+  [rsp+0x40] == NULL || {[rsp+0x40], [rsp+0x48], [rsp+0x50], [rsp+0x58], ...} is a valid argv
+
+0xe534f execve("/bin/sh", r13, rbx)
+constraints:
+  [r13] == NULL || r13 == NULL || r13 is a valid argv
+  [rbx] == NULL || rbx == NULL || rbx is a valid envp
+
+0xe54f7 execve("/bin/sh", [rbp-0x88], [rbp-0x70])
+constraints:
+  [[rbp-0x88]] == NULL || [rbp-0x88] == NULL || [rbp-0x88] is a valid argv
+  [[rbp-0x70]] == NULL || [rbp-0x70] == NULL || [rbp-0x70] is a valid envp
+
+0xe54fe execve("/bin/sh", rcx, [rbp-0x70])
+constraints:
+  [rcx] == NULL || rcx == NULL || rcx is a valid argv
+  [[rbp-0x70]] == NULL || [rbp-0x70] == NULL || [rbp-0x70] is a valid envp
+
+0xe5502 execve("/bin/sh", rcx, rdx)
+constraints:
+  [rcx] == NULL || rcx == NULL || rcx is a valid argv
+  [rdx] == NULL || rdx == NULL || rdx is a valid envp
+
+0x10a2fc execve("/bin/sh", rsp+0x70, environ)
+constraints:
+  [rsp+0x70] == NULL || {[rsp+0x70], [rsp+0x78], [rsp+0x80], [rsp+0x88], ...} is a valid argv
+
+0x10a308 execve("/bin/sh", rsi, [rax])
+constraints:
+  [rsi] == NULL || rsi == NULL || rsi is a valid argv
+  [[rax]] == NULL || [rax] == NULL || [rax] is a valid envp

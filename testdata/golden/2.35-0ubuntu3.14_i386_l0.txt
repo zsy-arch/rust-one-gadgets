@@ -1,0 +1,16 @@
+0xdeea3 execve("/bin/sh", [ebp-0x30], [ebp-0x2c])
+constraints:
+  address ebp-0x20 is writable
+  ebx is the GOT address of libc
+  [[ebp-0x30]] == NULL || [ebp-0x30] == NULL || [ebp-0x30] is a valid argv
+  [[ebp-0x2c]] == NULL || [ebp-0x2c] == NULL || [ebp-0x2c] is a valid envp
+
+0x172981 execl("/bin/sh", eax)
+constraints:
+  esi is the GOT address of libc
+  eax == NULL
+
+0x172982 execl("/bin/sh", [esp])
+constraints:
+  esi is the GOT address of libc
+  [esp] == NULL

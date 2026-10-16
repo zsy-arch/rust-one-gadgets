@@ -1,0 +1,37 @@
+0xeb4a8 execve("/bin/sh", [ebp-0x30], esi)
+constraints:
+  address ebp-0x24 is writable
+  [ebp-0x2c] is the GOT address of libc
+  [[ebp-0x30]] == NULL || [ebp-0x30] == NULL || [ebp-0x30] is a valid argv
+  [esi] == NULL || esi == NULL || esi is a valid envp
+
+0xeb4ab execve("/bin/sh", [ebp-0x30], esi)
+constraints:
+  address ebp-0x24 is writable
+  ecx is the GOT address of libc
+  [[ebp-0x30]] == NULL || [ebp-0x30] == NULL || [ebp-0x30] is a valid argv
+  [esi] == NULL || esi == NULL || esi is a valid envp
+
+0xeb4b1 execve("/bin/sh", [ebp-0x30], esi)
+constraints:
+  address ebp-0x20 is writable
+  ecx is the GOT address of libc
+  [[ebp-0x30]] == NULL || [ebp-0x30] == NULL || [ebp-0x30] is a valid argv
+  [esi] == NULL || esi == NULL || esi is a valid envp
+
+0xeb4b8 execve("/bin/sh", [ebp-0x30], esi)
+constraints:
+  address ebp-0x30 is writable
+  ecx is the GOT address of libc
+  [[ebp-0x30]] == NULL || [ebp-0x30] == NULL || [ebp-0x30] is a valid argv
+  [esi] == NULL || esi == NULL || esi is a valid envp
+
+0x1885b1 execl("/bin/sh", eax)
+constraints:
+  esi is the GOT address of libc
+  eax == NULL
+
+0x1885b2 execl("/bin/sh", [esp])
+constraints:
+  esi is the GOT address of libc
+  [esp] == NULL

@@ -1,0 +1,51 @@
+0x3d0d3 execve("/bin/sh", esp+0x34, environ)
+constraints:
+  esi is the GOT address of libc
+  [esp+0x34] == NULL || {[esp+0x34], [esp+0x38], [esp+0x3c], [esp+0x40], ...} is a valid argv
+
+0x3d0d5 execve("/bin/sh", esp+0x38, environ)
+constraints:
+  esi is the GOT address of libc
+  [esp+0x38] == NULL || {[esp+0x38], [esp+0x3c], [esp+0x40], [esp+0x44], ...} is a valid argv
+
+0x3d0d9 execve("/bin/sh", esp+0x3c, environ)
+constraints:
+  esi is the GOT address of libc
+  [esp+0x3c] == NULL || {[esp+0x3c], [esp+0x40], [esp+0x44], [esp+0x48], ...} is a valid argv
+
+0x3d0e0 execve("/bin/sh", esp+0x40, environ)
+constraints:
+  esi is the GOT address of libc
+  [esp+0x40] == NULL || {[esp+0x40], [esp+0x44], [esp+0x48], [esp+0x4c], ...} is a valid argv
+
+0x3d103 execve("/bin/sh", eax, [esp])
+constraints:
+  esi is the GOT address of libc
+  [eax] == NULL || eax == NULL || eax is a valid argv
+  [[esp]] == NULL || [esp] == NULL || [esp] is a valid envp
+
+0x3d104 execve("/bin/sh", [esp], [esp+0x4])
+constraints:
+  esi is the GOT address of libc
+  [[esp]] == NULL || [esp] == NULL || [esp] is a valid argv
+  [[esp+0x4]] == NULL || [esp+0x4] == NULL || [esp+0x4] is a valid envp
+
+0x67a7f execl("/bin/sh", eax)
+constraints:
+  esi is the GOT address of libc
+  eax == NULL
+
+0x67a80 execl("/bin/sh", [esp])
+constraints:
+  esi is the GOT address of libc
+  [esp] == NULL
+
+0x137e5e execl("/bin/sh", eax)
+constraints:
+  ebx is the GOT address of libc
+  eax == NULL
+
+0x137e5f execl("/bin/sh", [esp])
+constraints:
+  ebx is the GOT address of libc
+  [esp] == NULL
