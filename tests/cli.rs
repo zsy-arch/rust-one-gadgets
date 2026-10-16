@@ -18,12 +18,25 @@ fn run(args: &[&str]) -> (String, String, bool) {
 /// 2.23-0ubuntu3_amd64 的 build-id（在 859 条内置库中）。
 const BID_223: &str = "369de0e1d833caa693af17f17c83ba937f0a4dad";
 
+
+/// CLI 测试用的 2.23 样本；二进制不入库，缺失时跳过依赖它的测试。
+fn sample_223() -> Option<&'static str> {
+    let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/libc-2.23-0ubuntu3_amd64.so");
+    if p.exists() {
+        Some("testdata/libc-2.23-0ubuntu3_amd64.so")
+    } else {
+        eprintln!("testdata/*.so 不存在 — 跳过（获取方式见 README）");
+        None
+    }
+}
+
 #[test]
 fn build_id_lookup_matches_file_db_path() {
     // -b 与「给文件且 DB 命中」两条路径给出同一组 gadgets
+    let Some(f) = sample_223() else { return };
     let (b_out, _, ok) = run(&["-b", BID_223, "-l", "1", "-r"]);
     assert!(ok);
-    let (f_out, _, ok2) = run(&["testdata/libc-2.23-0ubuntu3_amd64.so", "-l", "1", "-r"]);
+    let (f_out, _, ok2) = run(&[f, "-l", "1", "-r"]);
     assert!(ok2);
     assert_eq!(b_out, f_out, "-b and file(DB-hit) must agree");
     assert!(!b_out.trim().is_empty());
@@ -40,7 +53,7 @@ fn build_id_prefix_and_errors() {
     let (_, err, ok) = run(&["-b", "ffffffff00000000feed", "-l", "1"]);
     assert!(!ok);
     assert!(err.contains("not found"), "err: {err}");
-    // 文件 + build-id 互斥
+    // 文件 + build-id 互斥（互斥检查在读文件前，路径无需存在）
     let (_, err, ok) = run(&["-b", BID_223, "testdata/libc-2.23-0ubuntu3_amd64.so"]);
     assert!(!ok);
     assert!(err.contains("Either FILE or BuildID"));
@@ -49,11 +62,12 @@ fn build_id_prefix_and_errors() {
 #[test]
 fn force_file_overrides_db() {
     // 该测试 libc 恰好在内置库中（上游扫的就是同一文件），-f 与 DB 路径给出同一组
-    let (scan, _, ok) = run(&["testdata/libc-2.23-0ubuntu3_amd64.so", "-f", "-l", "1", "-r"]);
+    let Some(f) = sample_223() else { return };
+    let (scan, _, ok) = run(&[f, "-f", "-l", "1", "-r"]);
     assert!(ok);
     // master --raw 输出十进制偏移（0x451ff = 283135）
     assert!(scan.contains("283135"), "-f must produce scan gadgets: {scan}");
-    let (db, _, _) = run(&["testdata/libc-2.23-0ubuntu3_amd64.so", "-l", "1", "-r"]);
+    let (db, _, _) = run(&[f, "-l", "1", "-r"]);
     assert_eq!(scan.trim(), db.trim(), "for this corpus build both paths must agree");
 }
 
@@ -69,11 +83,8 @@ fn info_build_id() {
 
 #[test]
 fn near_functions_sort() {
-    let (out, err, ok) = run(&[
-        "--near", "printf,system",
-        "testdata/libc-2.23-0ubuntu3_amd64.so",
-        "-f", "-l", "1", "-r",
-    ]);
+    let Some(f) = sample_223() else { return };
+    let (out, err, ok) = run(&["--near", "printf,system", f, "-f", "-l", "1", "-r"]);
     assert!(ok, "err: {err}");
     assert!(err.contains("Gadgets near printf(0x557b0)"), "err: {err}");
     assert!(err.contains("Gadgets near system(0x45380)"), "err: {err}");
@@ -93,18 +104,16 @@ fn near_requires_libc_file() {
 #[test]
 fn script_runs_each_gadget() {
     // -l 0 + 脚本 echo：每 gadget 一行 Trying
-    let (_, err, ok) = run(&[
-        "-s", "echo hi",
-        "testdata/libc-2.23-0ubuntu3_amd64.so",
-        "-f",
-    ]);
+    let Some(f) = sample_223() else { return };
+    let (_, err, ok) = run(&["-s", "echo hi", f, "-f"]);
     assert!(ok);
     assert!(err.contains("Trying 0x"), "{err}");
 }
 
 #[test]
 fn json_output_gadgets() {
-    let (out, _, ok) = run(&["testdata/libc-2.23-0ubuntu3_amd64.so", "-f", "-l", "1", "-o", "json"]);
+    let Some(f) = sample_223() else { return };
+    let (out, _, ok) = run(&[f, "-f", "-l", "1", "-o", "json"]);
     assert!(ok);
     let v: serde_json::Value = serde_json::from_str(&out).expect("valid json");
     assert!(v.as_array().is_some_and(|a| !a.is_empty()));
